@@ -1,0 +1,7 @@
+# package info
+build
+dist
+
+# cache files
+*.pyc
+*.swp

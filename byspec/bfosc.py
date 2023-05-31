@@ -6,6 +6,8 @@ import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 
 from .imageproc import combine_images
+from .onedarray import iterative_savgol_filter
+from .visual import plot_image_with_hist
 
 def print_wrapper(string, item):
     """A wrapper for obslog printing
@@ -122,8 +124,13 @@ class _BFOSC(object):
             os.mkdir(reduction_path)
         self.reduction_path = reduction_path
 
+        self.figpath = os.path.join(self.reduction_path, 'figures')
+        if not os.path.exists(self.figpath):
+            os.mkdir(self.figpath)
+
         self.bias_file = os.path.join(self.reduction_path, 'bias.fits')
         self.flat_file = os.path.join(self.reduction_path, 'flat.fits')
+        self.sens_file = os.path.join(self.reduction_path, 'sens.fits')
 
     def make_obslog(self):
         obstable = make_obslog(self.rawdata_path, display=True)
@@ -147,8 +154,8 @@ class _BFOSC(object):
 
     def get_bias(self):
 
-        if False:
-            pass
+        if os.path.exists(self.bias_file):
+            self.bias_data = fits.getdata(self.bias_file)
 
         else:
             print('Combine bias')
@@ -168,6 +175,73 @@ class _BFOSC(object):
             fits.writeto(self.bias_file, bias_data, overwrite=True)
             self.bias_data = bias_data
 
+    def plot_bias(self, show=True):
+        figfilename = os.path.join(self.figpath, 'bias.png')
+        title = 'Bias ({})'.format(os.path.basename(self.bias_file))
+        plot_image_with_hist(self.bias_data,
+                        show        = show,
+                        figfilename = figfilename,
+                        title       = title,
+                        )
+
+    def plot_flat(self, show=True):
+        figfilename = os.path.join(self.figpath, 'flat.png')
+        title = 'Flat ({})'.format(os.path.basename(self.flat_file))
+        plot_image_with_hist(self.flat_data,
+                        show        = show,
+                        figfilename = figfilename,
+                        title       = title,
+                        )
+
+    def plot_sens(self, show=True):
+        figfilename = os.path.join(self.figpath, 'sens.png')
+        title = 'Sensitivity ({})'.format(os.path.basename(self.sens_file))
+        plot_image_with_hist(self.sens_data,
+                        show        = show,
+                        figfilename = figfilename,
+                        title       = title,
+                        )
+
+    def combine_flat(self):
+        if os.path.exists(self.flat_file):
+            self.flat_data = fits.getdata(self.flat_file)
+        else:
+            print('Combine Flat')
+            data_lst = []
+
+            flat_item_lst = filter(lambda item: item['datatype']=='SPECLFLAT',
+                                   self.logtable)
+            for logitem in flat_item_lst:
+                filename = self.fileid_to_filename(logitem['fileid'])
+                data = fits.getdata(filename)
+                # correct bias
+                data = data - self.bias_data
+                data_lst.append(data)
+            data_lst = np.array(data_lst)
+            flat_data = combine_images(data_lst, mode='mean',
+                                    upper_clip=5, maxiter=10, maskmode='max')
+            fits.writeto(self.flat_file, flat_data, overwrite=True)
+            self.flat_data = flat_data
+
+    def get_sens(self):
+        ny, nx = self.flat_data.shape
+        allx = np.arange(nx)
+        flat_sens = np.ones_like(self.flat_data, dtype=np.float64)
+
+
+        for y in np.arange(ny):
+            #flat1d = self.flat_data[y, 20:int(nx) - 20]
+            flat1d = self.flat_data[y, :]
+
+            flat1d_sm, _, mask, std = iterative_savgol_filter(flat1d,
+                                        winlen=51, order=3,
+                                        upper_clip=6, lower_clip=6, maxiter=10)
+            #flat_sens[y, 20:int(nx) - 20] = flat1d / flat1d_sm
+            flat_sens[y, :] = flat1d / flat1d_sm
+
+        fits.writeto(self.sens_file, flat_sens, overwrite=True)
+
+        self.sens_data = flat_sens
 
 
 BFOSC = _BFOSC()

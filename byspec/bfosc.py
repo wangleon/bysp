@@ -1,12 +1,14 @@
 import os
 import re
 import numpy as np
+import scipy.optimize as opt
 from astropy.table import Table
 import astropy.io.fits as fits
 import matplotlib.pyplot as plt
+import matplotlib.ticker as tck
 
 from .imageproc import combine_images
-from .onedarray import iterative_savgol_filter
+from .onedarray import iterative_savgol_filter, get_simple_ccf, gengaussian
 from .visual import plot_image_with_hist
 
 def print_wrapper(string, item):
@@ -228,7 +230,6 @@ class _BFOSC(object):
         allx = np.arange(nx)
         flat_sens = np.ones_like(self.flat_data, dtype=np.float64)
 
-
         for y in np.arange(ny):
             #flat1d = self.flat_data[y, 20:int(nx) - 20]
             flat1d = self.flat_data[y, :]
@@ -242,6 +243,203 @@ class _BFOSC(object):
         fits.writeto(self.sens_file, flat_sens, overwrite=True)
 
         self.sens_data = flat_sens
+
+    def extract_lamp(self):
+        lamp_item_lst = filter(lambda item: item['datatype']=='SPECLLAMP',
+                               self.logtable)
+
+        hwidth = 5
+
+        spec_lst = {} # use to save the extracted 1d spectra of calib lamp
+
+        for logitem in lamp_item_lst:
+            fileid = logitem['fileid']
+            filename = self.fileid_to_filename(fileid)
+            data = fits.getdata(filename)
+            data = data - self.bias_data
+            data = data / self.sens_data
+
+            ny, nx = data.shape
+
+            # extract 1d spectra of wavelength calibration lamp
+            spec = data[ny//2-hwidth: ny//2+hwidth+1, :].sum(axis=0)
+            spec_lst[fileid] = {'wavelength': None, 'flux': spec}
+
+        self.lamp_spec_lst = spec_lst
+
+    def identify_wavelength(self):
+
+        filename = os.path.dirname(__file__) + '/data/linelist/FeAr.dat'
+        linelist = Table.read(filename, format='ascii.fixed_width_two_line')
+        wavebound = 6900 # wavelength boundary to separate the red and blue
+
+        # determine blue and red calib lamp
+        q95_lst = {}
+
+        lamp_item_lst = filter(lambda item: item['datatype']=='SPECLLAMP',
+                               self.logtable)
+
+        for logitem in lamp_item_lst:
+            filename = self.fileid_to_filename(logitem['fileid'])
+            data = fits.getdata(filename)
+            q95 = np.percentile(data, 95)
+            q95_lst[logitem['fileid']] = q95
+        sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
+        blue_fileid = sorted_q95_lst[0][0]
+        red_fileid  = sorted_q95_lst[-1][0]
+        print('BLUE:', blue_fileid)
+        print('RED:',  red_fileid)
+
+        def errfunc(p, x, y, fitfunc):
+            return y - fitfunc(p, x)
+        def fitline(p, x):
+            return gengaussian(p[0], p[1], p[2], p[3], x) + p[4]
+
+        fig = plt.figure(figsize=(15, 8))
+        nrow, ncol = 4, 6
+
+        linelist=np.loadtxt('wl_guess.txt2') 
+        wlred = np.loadtxt('wlcalib_red.dat')
+        wlblue = np.loadtxt('wlcalib_blue.dat')
+
+        count_line = 0
+        center_lst = []
+        wave_lst = []
+
+        shift_lst = np.arange(-100, 100)
+        for fileid in [red_fileid, blue_fileid]:
+            flux = self.lamp_spec_lst[fileid]['flux']
+            if fileid == red_fileid:
+                m = linelist[:, 1] > wavebound
+                ccf_lst = get_simple_ccf(flux, wlred[:, 1], shift_lst)
+                band = 'red'
+            elif fileid == blue_fileid:
+                m = linelist[:, 1] < wavebound
+                ccf_lst = get_simple_ccf(flux, wlblue[:,1], shift_lst)
+                band = 'blue'
+            else:
+                raise ValueError
+
+            '''
+            fig = plt.figure()
+            ax = fig.gca()
+            ax.plot(shift_lst, ccf_lst)
+
+            fig2 = plt.figure()
+            ax2 = fig2.gca()
+            ax2.plot(flux)
+            ax2.plot(wlred[:,1])
+            ax2.plot(wlblue[:,1])
+            '''
+
+            pixel_correct = shift_lst[ccf_lst.argmax()]
+            cutlinelist = linelist[m]
+
+            init_pixel_lst = cutlinelist[:, 0] + pixel_correct
+            init_wave_lst = cutlinelist[:, 1]
+
+            for x, wave in zip(init_pixel_lst, init_wave_lst):
+                nx = flux.size
+                allx = np.arange(nx)
+                i = np.searchsorted(allx, x)
+                i1, i2 = i - 9, i + 10
+                xdata = allx[i1:i2]
+                ydata = flux[i1:i2]
+
+                p0 = [ydata.max()-ydata.min(), 3.6, 3.5, i, ydata.min()]
+                fitres = opt.least_squares(errfunc, p0,
+                            bounds=([-np.inf, 0.5,  0.1, i1, -np.inf],
+                                    [np.inf, 20.0, 20.0, i2, ydata.max()]),
+                            args=(xdata, ydata, fitline),
+                        )
+
+                p = fitres['x']
+                A, alpha, beta, center, bkg = p
+                center_lst.append(center)
+                wave_lst.append(wave)
+
+                ix = count_line % ncol
+                iy = nrow - 1 - count_line // ncol
+                axs = fig.add_axes([0.07+ix*0.16, 0.08+iy*0.23, 0.12, 0.20])
+                if band == 'red':
+                    color = 'C3'
+                elif band == 'blue':
+                    color = 'C0'
+                else:
+                    color = 'k'
+                axs.scatter(xdata, ydata, s=10, alpha=0.6, color=color)
+                newx = np.arange(i1, i2, 0.1)
+                newy = fitline(p, newx)
+                axs.plot(newx, newy, ls='-', color='C1', lw=1, alpha=0.7)
+                axs.axvline(x=center, color='k', ls='--', lw=0.7)
+                axs.set_xlim(newx[0], newx[-1])
+                x1, x2 = axs.get_xlim()
+                y1, y2 = axs.get_ylim()
+                axs.text(0.95*x1+0.05*x2, 0.2*y1+0.8*y2, '{:9.4f}'.format(wave),
+                         fontsize=9)
+                axs.xaxis.set_major_locator(tck.MultipleLocator(5))
+                axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
+                for tick in axs.yaxis.get_major_ticks():
+                    tick.label1.set_fontsize(9)
+                
+                count_line += 1
+
+        figname = 'fitlines.png'
+        figfilename = os.path.join(self.figpath, figname)
+        fig.savefig(figfilename)
+        plt.show()
+        plt.close(fig)
+
+
+        wave_lst = np.array(wave_lst)
+        center_lst = np.array(center_lst)
+
+        idx = center_lst.argsort()
+        center_lst = center_lst[idx]
+        wave_lst = wave_lst[idx]
+
+        coeff_wave = np.polyfit(center_lst, wave_lst, deg=5)
+        allwave = np.polyval(coeff_wave, allx)
+        fitwave = np.polyval(coeff_wave, center_lst)
+        reswave = wave_lst - fitwave
+        stdwave = reswave.std()
+
+
+        # plot wavelength solution
+        figt = plt.figure(figsize=(12, 6), dpi=300)
+        axt1 = figt.add_axes([0.07, 0.40, 0.44, 0.52])
+        axt2 = figt.add_axes([0.07, 0.10, 0.44, 0.26])
+        #axt3 = figt.add_axes([0.07, 0.10, 0.44, 0.26])
+        axt4 = figt.add_axes([0.58, 0.54, 0.37, 0.38])
+        axt5 = figt.add_axes([0.58, 0.10, 0.37, 0.38])
+        axt1.scatter(center_lst, wave_lst, s=20)
+        axt1.plot(allx, allwave)
+        axt2.scatter(center_lst, wave_lst - np.polyval(coeff_wave, center_lst), s=20)
+        axt2.axhline(y=0, color='k', ls='--')
+        axt2.axhline(y=stdwave, color='k', ls='--', alpha=0.4)
+        axt2.axhline(y=-stdwave, color='k', ls='--', alpha=0.4)
+        for ax in figt.get_axes():
+            ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
+            ax.set_axisbelow(True)
+            ax.set_xlim(0, nx - 1)
+        y1, y2 = axt2.get_ylim()
+        axt2.text(0.03 * nx, 0.2 * y1 + 0.8 * y2, u'RMS = {:5.3f} \xc5'.format(stdwave))
+        axt2.set_ylim(y1, y2)
+        axt2.set_xlabel('Pixel')
+        axt1.set_ylabel(u'\u03bb (\xc5)')
+        axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
+        axt1.set_xticklabels([])
+        axt4.plot(allx[0:-1], -np.diff(allwave))
+        axt5.plot(allx[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+        axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
+        axt5.set_xlabel('Pixel')
+        axt5.set_ylabel(u'dv/dx (km/s)')
+        title = 'Wavelength Solution'
+        figt.suptitle(title)
+        figname = 'wavelength.png'
+        figfilename = os.path.join(self.figpath, figname)
+        figt.savefig(figfilename)
+        plt.close(figt)
 
 
 BFOSC = _BFOSC()

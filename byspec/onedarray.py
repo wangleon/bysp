@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import scipy.interpolate as intp
 from scipy.signal import savgol_filter
@@ -49,4 +50,33 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
         mask = new_mask
 
     return ysmooth, yres, mask, std
+
+def gengaussian(A, alpha, beta, c, x):
+    return A*np.exp(-(np.abs(x-c)/alpha)**beta)
+
+def gaussian(A, fwhm, c, x):
+    s = fwhm/2.35482
+    return A*np.exp(-(x-c)**2/2./s**2)
+
+def get_simple_ccf(flux1, flux2, shift_lst):
+    """Get cross-correlation function of two fluxes with the given relative
+    shift.
+    Args:
+        flux1 (:class:`numpy.ndarray`): Input flux array.
+        flux2 (:class:`numpy.ndarray`): Input flux array.
+        shift_lst (:class:`numpy.ndarray`): List of pixel shifts.
+    Returns:
+        :class:`numpy.ndarray`: Cross-correlation function
+    """
+
+    n = flux1.size
+    ccf_lst = []
+    for shift in shift_lst:
+        segment1 = flux1[max(0,shift):min(n,n+shift)]
+        segment2 = flux2[max(0,-shift):min(n,n-shift)]
+        c1 = math.sqrt((segment1**2).sum())
+        c2 = math.sqrt((segment2**2).sum())
+        corr = np.correlate(segment1, segment2)/c1/c2
+        ccf_lst.append(corr)
+    return np.array(ccf_lst)
 

@@ -8,4 +8,9 @@ setup(
     zip_safe    = False,
     packages    = ['byspec',
                    ],
+    package_data = {
+        'byspec': ['data/linelist/*',
+                   ]
+
+        },
     )

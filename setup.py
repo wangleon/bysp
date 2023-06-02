@@ -9,8 +9,10 @@ setup(
     packages    = ['byspec',
                    ],
     package_data = {
-        'byspec': ['data/linelist/*',
-                   ]
+        'byspec': [
+                'data/calib/*',
+                'data/linelist/*',
+                ]
 
         },
     )

@@ -13,7 +13,7 @@ import matplotlib.ticker as tck
 from .utils import get_file
 from .imageproc import combine_images
 from .onedarray import (iterative_savgol_filter, get_simple_ccf, gengaussian,
-                        consecutive)
+                        consecutive, find_shift_ccf)
 from .visual import plot_image_with_hist
 
 def print_wrapper(string, item):
@@ -229,6 +229,8 @@ class _BFOSC(object):
         ###
         self.logtable = obstable
 
+        self.find_calib_groups()
+
     def fileid_to_filename(self, fileid):
         for fname in os.listdir(self.rawdata_path):
             if fname.startswith(str(fileid)):
@@ -369,12 +371,9 @@ class _BFOSC(object):
         def fitline(p, x):
             return gengaussian(p[0], p[1], p[2], p[3], x) + p[4]
 
-        func = lambda item: item['datatype']=='SPECLLAMP' and \
-                item['object']=='FeAr'
-        lamp_item_lst = list(filter(func, self.logtable))
-        logitem_groups = group_caliblamps(lamp_item_lst)
+        self.wave_solutions = {}
 
-        for logitem_lst in logitem_groups:
+        for logitem_lst in self.calib_groups:
             # determine blue and red calib lamp
             q95_lst = {}
 
@@ -393,13 +392,13 @@ class _BFOSC(object):
             print('RED:',  bandselect_fileids['R'])
 
             # use red flux to compute ccf
-            red_fileid = bandselect_fileids['R']
-            flux = self.lamp_spec_lst[red_fileid]['flux']
+            _fileid = bandselect_fileids['R']
+            flux = self.lamp_spec_lst[_fileid]['flux']
             ccf_lst = get_simple_ccf(flux, ref_flux, shift_lst)
 
-            fig = plt.figure()
-            ax = fig.gca()
-            ax.plot(shift_lst, ccf_lst, c='C3')
+            #fig = plt.figure()
+            #ax = fig.gca()
+            #ax.plot(shift_lst, ccf_lst, c='C3')
 
             pixel_corr = shift_lst[ccf_lst.argmax()]
             print(pixel_corr)
@@ -430,10 +429,10 @@ class _BFOSC(object):
                     dateobs = _logitem['dateobs']
             newfileid = get_mosaic_fileid(self.obsdate, dateobs)
 
-            fig2 = plt.figure()
-            ax2 = fig2.gca()
-            ax2.plot(flux_mosaic)
-            plt.show()
+            #fig2 = plt.figure()
+            #ax2 = fig2.gca()
+            #ax2.plot(flux_mosaic)
+            #plt.show()
 
             wave_lst = []
             center_lst = []
@@ -557,75 +556,63 @@ class _BFOSC(object):
             _y1, _y2 = ax_imap1.get_ylim()
             ax_imap1.vlines(wave_lst, _y1, _y2, color='k', lw=0.5, ls='--')
             ax_imap1.set_ylim(_y1, _y2)
-            ax_imap1.set_xlim(allwave[0], allwave[-1])
+            ax_imap2.plot(allwave, pixel_lst, lw=0.5)
+            for ax in fig_imap.get_axes():
+                ax.grid(True, ls='--', lw=0.5)
+                ax.set_axisbelow(True)
+                ax.set_xlim(allwave[0], allwave[-1])
+            ax_imap2.set_xlabel(u'Wavelength (\xc5)')
             figname = 'wavelength_identmap_{}.png'.format(newfileid)
             figfilename = os.path.join(self.figpath, figname)
             fig_imap.savefig(figfilename)
             plt.show()
             plt.close(fig_imap)
 
-
-        # combine blue and red calib lamp
-        flux_blue = self.lamp_spec_lst[blue_fileid]['flux']
-        flux_red  = self.lamp_spec_lst[red_fileid]['flux']
-
-        flux_combined = combine_blue_red(allwave,
-                            flux_blue = flux_blue,
-                            flux_red  = flux_red,
-                            wavebound = wavebound,
-                            baseline  = 10,
-                            )
-        for logitem in self.logtable:
-            if logitem['fileid'] in [red_fileid, blue_fileid]:
-                dateobs = logitem['dateobs']
-        newfileid = get_combined_fileid(self.obsdate, dateobs)
-        data = Table(dtype=[
-            ('wavelength',  np.float64),
-            ('flux',        np.float32),
-            ])
-        for _w, _f in zip(allwave, flux):
-            data.add_row((_w, _f))
-        head = fits.Header()
-        head['OBJECT']   = 'FeAr'
-        head['TELESCOP'] = 'Xinglong 2.16m'
-        head['INSTRUME'] = 'BFOSC'
-        head['FILEID']   = newfileid
-        head['COMBINED'] = True
-        head['NCOMBINE'] = 2
-        head['WAVEBD']   = wavebound,
-        head['FILEID1']  = blue_fileid
-        head['FILEID2']  = red_fileid
-        head['INSTMODE'] = logitem['mode']
-        head['CONFIG']   = logitem['config']
-        head['NDISP']    = self.ndisp
-        head['SLIT']     = logitem['slit']
-        head['FILTER']   = logitem['filter']
-        head['BINNING']  = logitem['binning']
-        head['GAIN']     = logitem['gain']
-        head['RDNOISE']  = logitem['rdnoise']
-        head['OBSERVER'] = logitem['observer']
-        hdulst = fits.HDUList([
-                fits.PrimaryHDU(header=head),
-                fits.BinTableHDU(data=data),
-            ])
-        fname = 'wlcalib_{}.fits'.format(newfileid)
-        filename = os.path.join(self.reduction_path, fname)
-        hdulst.writeto(filename, overwrite=True)
+            # save wavelength calibration data
+            data = Table(dtype=[
+                ('wavelength',  np.float64),
+                ('flux',        np.float32),
+                ])
+            for _w, _f in zip(allwave, flux_mosaic):
+                data.add_row((_w, _f))
+            head = fits.Header()
+            head['OBJECT']   = 'FeAr'
+            head['TELESCOP'] = 'Xinglong 2.16m'
+            head['INSTRUME'] = 'BFOSC'
+            head['FILEID']   = newfileid
+            head['MOSAICED'] = True
+            head['NMOSAIC']  = 2
+            head['WAVEBD']   = wavebound,
+            head['FILEID1']  = fileid_B,
+            head['FILEID2']  = fileid_R,
+            head['INSTMODE'] = logitem['mode']
+            head['CONFIG']   = logitem['config']
+            head['NDISP']    = self.ndisp
+            head['SLIT']     = logitem['slit']
+            head['FILTER']   = logitem['filter']
+            head['BINNING']  = logitem['binning']
+            head['GAIN']     = logitem['gain']
+            head['RDNOISE']  = logitem['rdnoise']
+            head['OBSERVER'] = logitem['observer']
+            hdulst = fits.HDUList([
+                    fits.PrimaryHDU(header=head),
+                    fits.BinTableHDU(data=data),
+                    ])
+            fname = 'wlcalib_{}.fits'.format(newfileid)
+            filename = os.path.join(self.reduction_path, fname)
+            hdulst.writeto(filename, overwrite=True)
 
 
-        ident_list = Table(dtype=[
-            ('wavelength',  np.float64),
-            ('element',     str),
-            ('ion',         str),
-            ('pixel',       np.float32),
-            ('residual',    np.float64),
-            ('use',         int),
-            ])
+            ident_list = Table(dtype=[
+                ('wavelength',  np.float64),
+                ('element',     str),
+                ('ion',         str),
+                ('pixel',       np.float32),
+                ('residual',    np.float64),
+                ('use',         int),
+                ])
 
-
-        self.wavelength = allwave
-        self.calibflux  = flux_combined
-
+            self.wave_solutions[newfileid] = allwave
 
 
     def plot_wlcalib(self):
@@ -635,7 +622,113 @@ class _BFOSC(object):
         ax1.plot(self.wavelength, self.calibflux, lw=0.5)
         ax1.set_xlabel(u'Wavelength (\xc5)')
         plt.show()
+    
+    def find_calib_groups(self):
 
+        lamp_lst = {}
+        for logitem in self.logtable:
+            if logitem['datatype'] != 'SPECLLAMP':
+                continue
+            _objname = logitem['object']
+            if _objname not in lamp_lst:
+                lamp_lst[_objname] = []
+            lamp_lst[_objname].append(logitem)
+
+        groups = []
+        for lamp, lamp_item_lst in lamp_lst.items():
+            logitem_groups = group_caliblamps(lamp_item_lst)
+            for logitem_lst in logitem_groups:
+                groups.append(logitem_lst)
+        self.calib_groups = groups
+
+    def find_distortion(self):
+
+        wavebound = 6907
+        coeff_lst = {}
+
+        fig_dist = plt.figure(figsize=(8,6), dpi=100)
+        ax_dist = fig_dist.add_axes([0.1, 0.1, 0.85, 0.8])
+
+        for logitem_lst in self.calib_groups:
+            q95_lst = {}
+            for logitem in logitem_lst:
+                filename = self.fileid_to_filename(logitem['fileid'])
+                data = fits.getdata(filename)
+                q95 = np.percentile(data, 95)
+                q95_lst[logitem['fileid']] = q95
+            sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
+            bandselect_fileids = {
+                    'R': sorted_q95_lst[0][0], # choose the smallest as red
+                    'B': sorted_q95_lst[-1][0], # choose the largets as blue
+                    }
+
+            allwave = list(self.wave_solutions.values())[0]
+            for band in ['B', 'R']:
+                fileid = bandselect_fileids[band]
+                filename = self.fileid_to_filename(fileid)
+                data = fits.getdata(filename)
+                data = data - self.bias_data
+                data = data / self.sens_data
+                ny, nx = data.shape
+                allx = np.arange(nx)
+                ally = np.arange(ny)
+                hwidth = 5
+                ref_spec = data[ny//2-hwidth:ny//2+hwidth, :].sum(axis=0)
+                if band == 'R':
+                    mask = allwave > wavebound
+                else:
+                    mask = allwave < wavebound
+                ref_spec = ref_spec[mask]
+                xcoord = allx[mask]
+                ycoord_lst = []
+                xshift_lst = []
+
+                fig_distortion = plt.figure(dpi=100, figsize=(8, 6))
+                ax01 = fig_distortion.add_axes([0.1, 0.55, 0.85, 0.36])
+                ax02 = fig_distortion.add_axes([0.1, 0.10, 0.85, 0.36])
+                for i, y in enumerate(np.arange(100, ny-100, 200)):
+                    spec = data[y-hwidth:y+hwidth,:].sum(axis=0)
+                    spec = spec[mask]
+                    shift = find_shift_ccf(ref_spec, spec)
+                    ycoord_lst.append(y)
+                    xshift_lst.append(shift)
+                    if i == 0:
+                        ax01.plot(xcoord, spec, color='w', lw=0)
+                        y1, y2 = ax01.get_ylim()
+                        offset = (y2 - y1)/20
+                    ax01.plot(xcoord-shift, spec+offset*i, lw=0.5)
+                    ax02.plot(xcoord, spec+offset*i, lw=0.5)
+                ax01.set_xlim(xcoord[0], xcoord[-1])
+                ax02.set_xlim(xcoord[0], xcoord[-1])
+                ax02.set_xlabel('Pixel')
+                #fig.suptitle('{}'.format(fileid))
+                figname = 'distortion_{}.png'.format(band)
+                figfilename = os.path.join(self.figpath, figname)
+                fig_distortion.savefig(figfilename)
+                plt.close(fig_distortion)
+
+                coeff = np.polyfit(ycoord_lst, xshift_lst, deg=2)
+                color = {'B': 'C0', 'R': 'C3'}[band]
+                sign =  {'B': '<',  'R': '>'}[band]
+                label = u'(\u03bb {} {} \xc5)'.format(sign, wavebound)
+                ax_dist.plot(xshift_lst, ycoord_lst, 'o', c=color,
+                             alpha=0.7, label=label)
+                ax_dist.plot(np.polyval(coeff, ally), ally, color=color,
+                             alpha=0.7)
+        ax_dist.axhline(y=ny//2, ls='-', color='k', lw=0.7)
+        ax_dist.set_ylim(0, ny - 1)
+        ax_dist.xaxis.set_major_locator(tck.MultipleLocator(1))
+        ax_dist.set_xlabel('Shift (pixel)')
+        ax_dist.set_ylabel('Y (pixel)')
+        ax_dist.grid(True, ls='--')
+        ax_dist.set_axisbelow(True)
+        ax_dist.legend(loc='upper left')
+        figname = 'distortion_fitting.png'
+        figfilename = os.path.join(self.figpath, figname)
+        fig_dist.savefig(figfilename)
+        plt.close(fig_dist)
+
+    
 def group_caliblamps(lamp_item_lst):
     frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
 

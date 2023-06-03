@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import scipy.interpolate as intp
+import scipy.optimize as opt
 from scipy.signal import savgol_filter
 
 def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
@@ -25,7 +26,7 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
             * **std** (float) -- Standard deviation.
     """
     x = np.arange(y.size)
-    mask = np.ones_like(y, dtype=np.bool)
+    mask = np.ones_like(y, dtype=bool)
 
     for ite in range(maxiter):
 
@@ -38,7 +39,7 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
 
         # generate new mask
         # make a copy of existing mask
-        new_mask = mask * np.ones_like(mask, dtype=np.bool)
+        new_mask = mask * np.ones_like(mask, dtype=bool)
         # give new mask with lower and upper clipping value
         if lower_clip is not None:
             new_mask *= (yres > -lower_clip * std)
@@ -105,4 +106,11 @@ def get_simple_ccf(flux1, flux2, shift_lst):
         corr = np.correlate(segment1, segment2)/c1/c2
         ccf_lst.append(corr)
     return np.array(ccf_lst)
+
+def find_shift_ccf(f1, f2, shift0=0.0):
+    x = np.arange(f1.size)
+    interf = intp.InterpolatedUnivariateSpline(x, f1, k=3, ext=1)
+    func = lambda shift: -(interf(x - shift)*f2).sum(dtype=np.float64)
+    res = opt.minimize(func, shift0, method='Powell')
+    return res['x']
 

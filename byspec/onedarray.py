@@ -58,6 +58,9 @@ def gaussian(A, fwhm, c, x):
     s = fwhm/2.35482
     return A*np.exp(-(x-c)**2/2./s**2)
 
+def consecutive(data, stepsize=1):
+    return np.split(data, np.where(np.diff(data) > stepsize)[0]+1)
+
 def get_simple_ccf(flux1, flux2, shift_lst):
     """Get cross-correlation function of two fluxes with the given relative
     shift.

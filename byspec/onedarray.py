@@ -21,8 +21,8 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
 
             * **ysmooth** (:class:`numpy.ndarray`) -- Smoothed y values.
             * **yres** (:class:`numpy.ndarray`) -- Residuals of y values.
-            * **mask** (:class:`numpy.ndarray`) – Mask of y values.
-            * **std** (float) – Standard deviation.
+            * **mask** (:class:`numpy.ndarray`) -- Mask of y values.
+            * **std** (float) -- Standard deviation.
     """
     x = np.arange(y.size)
     mask = np.ones_like(y, dtype=np.bool)
@@ -52,9 +52,32 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
     return ysmooth, yres, mask, std
 
 def gengaussian(A, alpha, beta, c, x):
+    """Generalized Gaussian function.
+
+    Args:
+        A (float): Amplitude.
+        alpha (float): alpha value.
+        beta (float): beta value.
+        c (float): Central posistion of the function.
+        x (:class:`numpy.ndarray`): Input X values.
+    Returns:
+        :class:`numpy.ndarray`: Function values.
+
+    """
     return A*np.exp(-(np.abs(x-c)/alpha)**beta)
 
 def gaussian(A, fwhm, c, x):
+    """Gaussian function.
+
+    Args:
+        A (float): Amplitude.
+        fwhm (float): Full-width half maximum.
+        c (float): Central posistion of the function.
+        x (:class:`numpy.ndarray`): Input X values.
+    Returns:
+        :class:`numpy.ndarray`: Function values.
+
+    """
     s = fwhm/2.35482
     return A*np.exp(-(x-c)**2/2./s**2)
 

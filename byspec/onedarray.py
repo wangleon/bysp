@@ -114,3 +114,51 @@ def find_shift_ccf(f1, f2, shift0=0.0):
     res = opt.minimize(func, shift0, method='Powell')
     return res['x']
 
+def get_clip_mean(x, err=None, mask=None, high=3, low=3, maxiter=5):
+    """Get the mean value of an input array using the sigma-clipping method
+
+    Args:
+        x (:class:`numpy.ndarray`): The input array.
+        err (:class:`numpy.ndarray`): Errors of the input array.
+        mask (:class:`numpy.ndarray`): Initial mask of the input array.
+        high (float): Upper rejection threshold.
+        low (float): Loweer rejection threshold.
+        maxiter (int): Maximum number of iterations.
+
+    Returns:
+        tuple: A tuple containing:
+
+            * **mean** (*float*) – Mean value after the sigma-clipping.
+            * **std** (*float*) – Standard deviation after the sigma-clipping.
+            * **mask** (:class:`numpy.ndarray`) – Mask of accepted values in the
+              input array.
+    """
+    x = np.array(x)
+    if mask is None:
+        mask = np.zeros_like(x)<1
+
+    niter = 0
+    while(True):
+
+        niter += 1
+        if err is None:
+            mean = x[mask].mean()
+            std  = x[mask].std()
+        else:
+            mean = (x/err*mask).sum()/((1./err*mask).sum())
+            std = math.sqrt(((x - mean)**2/err*mask).sum()/((1./err*mask).sum()))
+
+        if maxiter==0 or niter>maxiter:
+            # return without new mask
+            break
+
+        # calculate new mask
+        new_mask = mask * (x < mean + high*std) * (x > mean - low*std)
+
+        if mask.sum() == new_mask.sum():
+            break
+        else:
+            mask = new_mask
+
+    return mean, std, new_mask
+

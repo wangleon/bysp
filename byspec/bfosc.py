@@ -4,15 +4,17 @@ import datetime
 import dateutil.parser
 
 import numpy as np
+import scipy.interpolate as intp
 import scipy.optimize as opt
-from astropy.table import Table
+from astropy.table import Table, Row
 import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tck
 
 from .utils import get_file
 from .imageproc import combine_images
-from .onedarray import (iterative_savgol_filter, get_simple_ccf, gengaussian,
+from .onedarray import (iterative_savgol_filter, get_simple_ccf,
+                        gaussian, gengaussian,
                         consecutive, find_shift_ccf, get_clip_mean)
 from .visual import plot_image_with_hist
 
@@ -372,6 +374,7 @@ class _BFOSC(object):
             return gengaussian(p[0], p[1], p[2], p[3], x) + p[4]
 
         self.wave_solutions = {}
+        coeff_wave_lst = []
 
         for logitem_lst in self.calib_groups:
             # determine blue and red calib lamp
@@ -512,6 +515,8 @@ class _BFOSC(object):
             fitwave = np.polyval(coeff_wave, center_lst)
             reswave = wave_lst - fitwave
             stdwave = reswave.std()
+            # append coeff
+            coeff_wave_lst.append(coeff_wave)
 
             # plot wavelength solution
             fig_sol = plt.figure(figsize=(12, 6), dpi=300)
@@ -614,6 +619,9 @@ class _BFOSC(object):
 
             self.wave_solutions[newfileid] = allwave
 
+        # determine the global wavelength coeff
+        self.wave_coeff = np.array(coeff_wave_lst).mean(axis=0)
+
 
     def plot_wlcalib(self):
         fig = plt.figure(figsize=(12,6), dpi=150)
@@ -648,6 +656,8 @@ class _BFOSC(object):
 
         fig_dist = plt.figure(figsize=(8,6), dpi=100)
         ax_dist = fig_dist.add_axes([0.1, 0.1, 0.85, 0.8])
+
+        coeff_lst = []
 
         for logitem_lst in self.calib_groups:
             q95_lst = {}
@@ -708,6 +718,9 @@ class _BFOSC(object):
                 plt.close(fig_distortion)
 
                 coeff = np.polyfit(ycoord_lst, xshift_lst, deg=2)
+                # append to results
+                coeff_lst.append(coeff)
+
                 color = {'B': 'C0', 'R': 'C3'}[band]
                 sign =  {'B': '<',  'R': '>'}[band]
                 label = u'(\u03bb {} {} \xc5)'.format(sign, wavebound)
@@ -727,6 +740,9 @@ class _BFOSC(object):
         figfilename = os.path.join(self.figpath, figname)
         fig_dist.savefig(figfilename)
         plt.close(fig_dist)
+
+        # take the average of coeff_lst as final curve_coeff
+        self.curve_coeff = np.array(coeff_lst).mean(axis=0)
 
 
 
@@ -773,10 +789,10 @@ class _BFOSC(object):
             else:
                 logitem = logitem_lst[0]
 
-        elif arg in self.logtable:
+        elif isinstance(arg, Row):
             logitem = arg
         else:
-            print('Unkown target: {}'.format(arg_)
+            print('Unkown target: {}'.format(arg_))
             return None
 
         fileid  = logitem['fileid']
@@ -804,8 +820,8 @@ class _BFOSC(object):
         ycen = np.polyval(coeff_loc, allx)
      
         # generate wavelength list considering horizontal shift
-        xshift_lst = np.polyval(curve_coeff, ycen)
-        wave_lst = np.polyval(coeff_wave, allx - xshift_lst)
+        xshift_lst = np.polyval(self.curve_coeff, ycen)
+        wave_lst = np.polyval(self.wave_coeff, allx - xshift_lst)
      
         # extract 1d sepectra
      
@@ -830,7 +846,7 @@ class _BFOSC(object):
         cdata = np.zeros_like(data, dtype=data.dtype)
         for y in np.arange(ny):
             row = data[y, :]
-            shift = np.polyval(curve_coeff, y) - np.polyval(curve_coeff, ycen0)
+            shift = np.polyval(self.curve_coeff, y) - np.polyval(self.curve_coeff, ycen0)
             f = intp.InterpolatedUnivariateSpline(allx, row, k=3, ext=3)
             cdata[y, :] = f(allx + shift)
 
@@ -990,6 +1006,14 @@ class _BFOSC(object):
 
 
 def find_order_location(data, figfilename, title):
+
+    def errfunc(p, x, y, fitfunc):
+        return y - fitfunc(p, x)
+
+    def fitfunc(p, x):
+        return gaussian(p[0], p[1], p[2], x)+p[3]
+
+
     ny, nx = data.shape
     allx = np.arange(nx)
     ally = np.arange(ny)

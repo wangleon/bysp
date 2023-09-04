@@ -871,7 +871,6 @@ class _BFOSC(object):
      
         # method 2
         for r1, r2 in background_rows:
-            bkgmask[r1:r2, :] = True
             cutdata = cdata[r1:r2, :]
             mean = cutdata.mean(axis=0)
             std = cutdata.std()

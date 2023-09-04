@@ -852,31 +852,9 @@ class _BFOSC(object):
 
         # initialize background mask
         bkgmask = np.zeros_like(data, dtype=bool)
+        background_rows = [(520, 800), (1000, 1250)]  # rows to exctract background
         for r1, r2 in background_rows:
             bkgmask[r1:r2, :] = True
-
-        '''
-        # plot image after distortion correction
-        title = 'Curvature Correction for {} ({})'.format(
-                fileid, objname)
-        fig3 = Figure2D(data=cdata, scale=(10, 99), title=title)
-        fig3.ax_image.plot(allx, ycen,
-                           color='C3', ls='-', lw=0.5, alpha=1)
-        fig3.ax_image.plot(allx, upper_line,
-                           color='C3', ls='--', lw=0.5, alpha=1)
-        fig3.ax_image.plot(allx, lower_line,
-                           color='C3', ls='--', lw=0.5, alpha=1)
-        # plot background mask regions
-        for r1, r2 in background_rows:
-            fig3.ax_image.plot(allx, np.repeat(r1, nx),
-                               color='C1', ls='-', lw=0.5, alpha=1)
-            fig3.ax_image.plot(allx, np.repeat(r2, nx),
-                               color='C1', ls='-', lw=0.5, alpha=1)
-        figname = 'loc_curve_{}.png'.format(logitem['fileid'])
-        figfilename = os.path.join(self.figpath, figname)
-        fig3.savefig(figfilename)
-        plt.close(fig3)
-        '''
 
         # remove cosmic rays in the background region
         # ori_bkgspec= (cdata*bkgmask).sum(axis=0)/(bkgmask.sum(axis=0))
@@ -923,7 +901,7 @@ class _BFOSC(object):
         crossspec[posmask] = (cdata * bkgmask).sum(axis=1)[posmask] / bkgmasksum[posmask]
         fitx = ally[posmask]
         fity = crossspec[posmask]
-        fitmask = np.ones_like(posmask, dtype=np.bool)
+        fitmask = np.ones_like(posmask, dtype=bool)
         maxiter = 3
         for i in range(maxiter):
             c = np.polyfit(fitx[fitmask], fity[fitmask], deg=2)
@@ -966,9 +944,9 @@ class _BFOSC(object):
         ax1.set_ylim(y1, y2)
         ax2.set_ylim(newy.min() - 6 * std, newy.max() + 6 * std)
         ax2.set_xlabel('Y (pixel)')
-        title = '{} ({})'.format(logitem['fileid'], logitem['object'])
+        title = '{} ({})'.format(fileid, objname)
         fig100.suptitle(title)
-        figname = 'bkg_cross_{}.png'.format(logitem['fileid'])
+        figname = 'bkg_cross_{}.png'.format(fileid)
         figfilename = os.path.join(self.figpath, figname)
         fig100.savefig(figfilename)
         plt.close(fig100)
@@ -992,7 +970,7 @@ class _BFOSC(object):
             ax.set_ylabel('Y (pixel)')
         title = '{} ({})'.format(fileid, objname)
         fig3.suptitle(title)
-        figname = 'bkg_region_{}.png'.format(logitem['fileid'])
+        figname = 'bkg_region_{}.png'.format(fileid)
         figfilename = os.path.join(self.figpath, figname)
         fig3.savefig(figfilename)
         plt.close(fig3)

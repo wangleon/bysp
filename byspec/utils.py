@@ -83,7 +83,8 @@ def download_file(url, filename, show_progress=True):
         disp_size,  unit_size  = get_human_readable_size(total_size)
 
         # get the width of the terminal
-        term_size = os.get_terminal_size()
+        # term_size = os.get_terminal_size()
+        term_size = os.terminal_size((80, 24))
 
         str1 = 'Downloading {}'.format(os.path.basename(filename))
         str2 = '{:6.2f}% of {:6.1f} {}'.format(percent, disp_size, unit_size)

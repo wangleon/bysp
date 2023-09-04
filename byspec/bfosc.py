@@ -4,16 +4,18 @@ import datetime
 import dateutil.parser
 
 import numpy as np
+import scipy.interpolate as intp
 import scipy.optimize as opt
-from astropy.table import Table
+from astropy.table import Table, Row
 import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tck
 
 from .utils import get_file
 from .imageproc import combine_images
-from .onedarray import (iterative_savgol_filter, get_simple_ccf, gengaussian,
-                        consecutive)
+from .onedarray import (iterative_savgol_filter, get_simple_ccf,
+                        gaussian, gengaussian,
+                        consecutive, find_shift_ccf, get_clip_mean)
 from .visual import plot_image_with_hist
 
 def print_wrapper(string, item):
@@ -229,6 +231,8 @@ class _BFOSC(object):
         ###
         self.logtable = obstable
 
+        self.find_calib_groups()
+
     def fileid_to_filename(self, fileid):
         for fname in os.listdir(self.rawdata_path):
             if fname.startswith(str(fileid)):
@@ -369,12 +373,10 @@ class _BFOSC(object):
         def fitline(p, x):
             return gengaussian(p[0], p[1], p[2], p[3], x) + p[4]
 
-        func = lambda item: item['datatype']=='SPECLLAMP' and \
-                item['object']=='FeAr'
-        lamp_item_lst = list(filter(func, self.logtable))
-        logitem_groups = group_caliblamps(lamp_item_lst)
+        self.wave_solutions = {}
+        coeff_wave_lst = []
 
-        for logitem_lst in logitem_groups:
+        for logitem_lst in self.calib_groups:
             # determine blue and red calib lamp
             q95_lst = {}
 
@@ -393,13 +395,13 @@ class _BFOSC(object):
             print('RED:',  bandselect_fileids['R'])
 
             # use red flux to compute ccf
-            red_fileid = bandselect_fileids['R']
-            flux = self.lamp_spec_lst[red_fileid]['flux']
+            _fileid = bandselect_fileids['R']
+            flux = self.lamp_spec_lst[_fileid]['flux']
             ccf_lst = get_simple_ccf(flux, ref_flux, shift_lst)
 
-            fig = plt.figure()
-            ax = fig.gca()
-            ax.plot(shift_lst, ccf_lst, c='C3')
+            #fig = plt.figure()
+            #ax = fig.gca()
+            #ax.plot(shift_lst, ccf_lst, c='C3')
 
             pixel_corr = shift_lst[ccf_lst.argmax()]
             print(pixel_corr)
@@ -430,10 +432,10 @@ class _BFOSC(object):
                     dateobs = _logitem['dateobs']
             newfileid = get_mosaic_fileid(self.obsdate, dateobs)
 
-            fig2 = plt.figure()
-            ax2 = fig2.gca()
-            ax2.plot(flux_mosaic)
-            plt.show()
+            #fig2 = plt.figure()
+            #ax2 = fig2.gca()
+            #ax2.plot(flux_mosaic)
+            #plt.show()
 
             wave_lst = []
             center_lst = []
@@ -513,6 +515,8 @@ class _BFOSC(object):
             fitwave = np.polyval(coeff_wave, center_lst)
             reswave = wave_lst - fitwave
             stdwave = reswave.std()
+            # append coeff
+            coeff_wave_lst.append(coeff_wave)
 
             # plot wavelength solution
             fig_sol = plt.figure(figsize=(12, 6), dpi=300)
@@ -557,75 +561,66 @@ class _BFOSC(object):
             _y1, _y2 = ax_imap1.get_ylim()
             ax_imap1.vlines(wave_lst, _y1, _y2, color='k', lw=0.5, ls='--')
             ax_imap1.set_ylim(_y1, _y2)
-            ax_imap1.set_xlim(allwave[0], allwave[-1])
+            ax_imap2.plot(allwave, pixel_lst, lw=0.5)
+            for ax in fig_imap.get_axes():
+                ax.grid(True, ls='--', lw=0.5)
+                ax.set_axisbelow(True)
+                ax.set_xlim(allwave[0], allwave[-1])
+            ax_imap2.set_xlabel(u'Wavelength (\xc5)')
             figname = 'wavelength_identmap_{}.png'.format(newfileid)
             figfilename = os.path.join(self.figpath, figname)
             fig_imap.savefig(figfilename)
             plt.show()
             plt.close(fig_imap)
 
-
-        # combine blue and red calib lamp
-        flux_blue = self.lamp_spec_lst[blue_fileid]['flux']
-        flux_red  = self.lamp_spec_lst[red_fileid]['flux']
-
-        flux_combined = combine_blue_red(allwave,
-                            flux_blue = flux_blue,
-                            flux_red  = flux_red,
-                            wavebound = wavebound,
-                            baseline  = 10,
-                            )
-        for logitem in self.logtable:
-            if logitem['fileid'] in [red_fileid, blue_fileid]:
-                dateobs = logitem['dateobs']
-        newfileid = get_combined_fileid(self.obsdate, dateobs)
-        data = Table(dtype=[
-            ('wavelength',  np.float64),
-            ('flux',        np.float32),
-            ])
-        for _w, _f in zip(allwave, flux):
-            data.add_row((_w, _f))
-        head = fits.Header()
-        head['OBJECT']   = 'FeAr'
-        head['TELESCOP'] = 'Xinglong 2.16m'
-        head['INSTRUME'] = 'BFOSC'
-        head['FILEID']   = newfileid
-        head['COMBINED'] = True
-        head['NCOMBINE'] = 2
-        head['WAVEBD']   = wavebound,
-        head['FILEID1']  = blue_fileid
-        head['FILEID2']  = red_fileid
-        head['INSTMODE'] = logitem['mode']
-        head['CONFIG']   = logitem['config']
-        head['NDISP']    = self.ndisp
-        head['SLIT']     = logitem['slit']
-        head['FILTER']   = logitem['filter']
-        head['BINNING']  = logitem['binning']
-        head['GAIN']     = logitem['gain']
-        head['RDNOISE']  = logitem['rdnoise']
-        head['OBSERVER'] = logitem['observer']
-        hdulst = fits.HDUList([
-                fits.PrimaryHDU(header=head),
-                fits.BinTableHDU(data=data),
-            ])
-        fname = 'wlcalib_{}.fits'.format(newfileid)
-        filename = os.path.join(self.reduction_path, fname)
-        hdulst.writeto(filename, overwrite=True)
+            # save wavelength calibration data
+            data = Table(dtype=[
+                ('wavelength',  np.float64),
+                ('flux',        np.float32),
+                ])
+            for _w, _f in zip(allwave, flux_mosaic):
+                data.add_row((_w, _f))
+            head = fits.Header()
+            head['OBJECT']   = 'FeAr'
+            head['TELESCOP'] = 'Xinglong 2.16m'
+            head['INSTRUME'] = 'BFOSC'
+            head['FILEID']   = newfileid
+            head['MOSAICED'] = True
+            head['NMOSAIC']  = 2
+            head['WAVEBD']   = wavebound,
+            head['FILEID1']  = fileid_B,
+            head['FILEID2']  = fileid_R,
+            head['INSTMODE'] = logitem['mode']
+            head['CONFIG']   = logitem['config']
+            head['NDISP']    = self.ndisp
+            head['SLIT']     = logitem['slit']
+            head['FILTER']   = logitem['filter']
+            head['BINNING']  = logitem['binning']
+            head['GAIN']     = logitem['gain']
+            head['RDNOISE']  = logitem['rdnoise']
+            head['OBSERVER'] = logitem['observer']
+            hdulst = fits.HDUList([
+                    fits.PrimaryHDU(header=head),
+                    fits.BinTableHDU(data=data),
+                    ])
+            fname = 'wlcalib_{}.fits'.format(newfileid)
+            filename = os.path.join(self.reduction_path, fname)
+            hdulst.writeto(filename, overwrite=True)
 
 
-        ident_list = Table(dtype=[
-            ('wavelength',  np.float64),
-            ('element',     str),
-            ('ion',         str),
-            ('pixel',       np.float32),
-            ('residual',    np.float64),
-            ('use',         int),
-            ])
+            ident_list = Table(dtype=[
+                ('wavelength',  np.float64),
+                ('element',     str),
+                ('ion',         str),
+                ('pixel',       np.float32),
+                ('residual',    np.float64),
+                ('use',         int),
+                ])
 
+            self.wave_solutions[newfileid] = allwave
 
-        self.wavelength = allwave
-        self.calibflux  = flux_combined
-
+        # determine the global wavelength coeff
+        self.wave_coeff = np.array(coeff_wave_lst).mean(axis=0)
 
 
     def plot_wlcalib(self):
@@ -635,6 +630,581 @@ class _BFOSC(object):
         ax1.plot(self.wavelength, self.calibflux, lw=0.5)
         ax1.set_xlabel(u'Wavelength (\xc5)')
         plt.show()
+    
+    def find_calib_groups(self):
+
+        lamp_lst = {}
+        for logitem in self.logtable:
+            if logitem['datatype'] != 'SPECLLAMP':
+                continue
+            _objname = logitem['object']
+            if _objname not in lamp_lst:
+                lamp_lst[_objname] = []
+            lamp_lst[_objname].append(logitem)
+
+        groups = []
+        for lamp, lamp_item_lst in lamp_lst.items():
+            logitem_groups = group_caliblamps(lamp_item_lst)
+            for logitem_lst in logitem_groups:
+                groups.append(logitem_lst)
+        self.calib_groups = groups
+
+    def find_distortion(self):
+
+        wavebound = 6907
+        coeff_lst = {}
+
+        fig_dist = plt.figure(figsize=(8,6), dpi=100)
+        ax_dist = fig_dist.add_axes([0.1, 0.1, 0.85, 0.8])
+
+        coeff_lst = []
+
+        for logitem_lst in self.calib_groups:
+            q95_lst = {}
+            for logitem in logitem_lst:
+                filename = self.fileid_to_filename(logitem['fileid'])
+                data = fits.getdata(filename)
+                q95 = np.percentile(data, 95)
+                q95_lst[logitem['fileid']] = q95
+            sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
+            bandselect_fileids = {
+                    'R': sorted_q95_lst[0][0], # choose the smallest as red
+                    'B': sorted_q95_lst[-1][0], # choose the largets as blue
+                    }
+
+            allwave = list(self.wave_solutions.values())[0]
+            for band in ['B', 'R']:
+                fileid = bandselect_fileids[band]
+                filename = self.fileid_to_filename(fileid)
+                data = fits.getdata(filename)
+                data = data - self.bias_data
+                data = data / self.sens_data
+                ny, nx = data.shape
+                allx = np.arange(nx)
+                ally = np.arange(ny)
+                hwidth = 5
+                ref_spec = data[ny//2-hwidth:ny//2+hwidth, :].sum(axis=0)
+                if band == 'R':
+                    mask = allwave > wavebound
+                else:
+                    mask = allwave < wavebound
+                ref_spec = ref_spec[mask]
+                xcoord = allx[mask]
+                ycoord_lst = []
+                xshift_lst = []
+
+                fig_distortion = plt.figure(dpi=100, figsize=(8, 6))
+                ax01 = fig_distortion.add_axes([0.1, 0.55, 0.85, 0.36])
+                ax02 = fig_distortion.add_axes([0.1, 0.10, 0.85, 0.36])
+                for i, y in enumerate(np.arange(100, ny-100, 200)):
+                    spec = data[y-hwidth:y+hwidth,:].sum(axis=0)
+                    spec = spec[mask]
+                    shift = find_shift_ccf(ref_spec, spec)
+                    ycoord_lst.append(y)
+                    xshift_lst.append(shift)
+                    if i == 0:
+                        ax01.plot(xcoord, spec, color='w', lw=0)
+                        y1, y2 = ax01.get_ylim()
+                        offset = (y2 - y1)/20
+                    ax01.plot(xcoord-shift, spec+offset*i, lw=0.5)
+                    ax02.plot(xcoord, spec+offset*i, lw=0.5)
+                ax01.set_xlim(xcoord[0], xcoord[-1])
+                ax02.set_xlim(xcoord[0], xcoord[-1])
+                ax02.set_xlabel('Pixel')
+                #fig.suptitle('{}'.format(fileid))
+                figname = 'distortion_{}.png'.format(band)
+                figfilename = os.path.join(self.figpath, figname)
+                fig_distortion.savefig(figfilename)
+                plt.close(fig_distortion)
+
+                coeff = np.polyfit(ycoord_lst, xshift_lst, deg=2)
+                # append to results
+                coeff_lst.append(coeff)
+
+                color = {'B': 'C0', 'R': 'C3'}[band]
+                sign =  {'B': '<',  'R': '>'}[band]
+                label = u'(\u03bb {} {} \xc5)'.format(sign, wavebound)
+                ax_dist.plot(xshift_lst, ycoord_lst, 'o', c=color,
+                             alpha=0.7, label=label)
+                ax_dist.plot(np.polyval(coeff, ally), ally, color=color,
+                             alpha=0.7)
+        ax_dist.axhline(y=ny//2, ls='-', color='k', lw=0.7)
+        ax_dist.set_ylim(0, ny - 1)
+        ax_dist.xaxis.set_major_locator(tck.MultipleLocator(1))
+        ax_dist.set_xlabel('Shift (pixel)')
+        ax_dist.set_ylabel('Y (pixel)')
+        ax_dist.grid(True, ls='--')
+        ax_dist.set_axisbelow(True)
+        ax_dist.legend(loc='upper left')
+        figname = 'distortion_fitting.png'
+        figfilename = os.path.join(self.figpath, figname)
+        fig_dist.savefig(figfilename)
+        plt.close(fig_dist)
+
+        # take the average of coeff_lst as final curve_coeff
+        self.curve_coeff = np.array(coeff_lst).mean(axis=0)
+
+
+
+
+    def extract_all_science(self):
+        func = lambda item: item['datatype']=='SPECLTARGET'
+        logitem_lst = list(filter(func, self.logtable))
+        for logitem in logitem_lst:
+            self.extract(logitem)
+
+
+    def extract(self, arg):
+
+        if isinstance(arg, int):
+            if arg > 19000000:
+                func = lambda item: item['datatype']=='SPECLTARGET' \
+                            and item['fileid']==arg
+                logitem_lst = list(filter(func, self.logtable))
+            else:
+                func = lambda item: item['datatype']=='SPECLTARGET' \
+                            and item['frameid']==arg
+                logitem_lst = list(filter(func, self.logtable))
+
+            if len(logitem_lst)==0:
+                print('unknown fileid: {}'.format(arg))
+                return None
+            elif len(logitem_lst)>1:
+                print('Multiple items found for {}'.format(arg))
+                return None
+            else:
+                logitem = logitem_lst[0]
+        elif isinstance(arg, str):
+
+            func = lambda item: item['datatype']=='SPECLTARGET' \
+                        and item['object'].lower()==arg.strip().lower()
+            logitem_lst = list(filter(func, self.logtable))
+
+            if len(logitem_lst)==0:
+                print('unknown object name: {}'.format(arg))
+                return None
+            elif len(logitem_lst)>1:
+                print('Multiple items found for {}'.format(arg))
+                return None
+            else:
+                logitem = logitem_lst[0]
+
+        elif isinstance(arg, Row):
+            logitem = arg
+        else:
+            print('Unkown target: {}'.format(arg_))
+            return None
+
+        fileid  = logitem['fileid']
+        objname = logitem['object']
+
+        print('* FileID: {} - 1d spectra extraction'.format(fileid))
+        filename = self.fileid_to_filename(fileid)
+        data = fits.getdata(filename)
+
+        data = data - self.bias_data
+        data = data / self.sens_data
+
+        ny, nx = data.shape
+        allx = np.arange(nx)
+        ally = np.arange(ny)
+        xdata = ally
+
+        figname = 'trace_{}.png'.format(fileid)
+        figfilename = os.path.join(self.figpath, figname)
+        title = 'Trace for {} ({})'.format(fileid, objname)
+        coeff_loc, fwhm_mean, profile_func = find_order_location(
+                                                data, figfilename, title)
+
+        # generate order location array
+        ycen = np.polyval(coeff_loc, allx)
+     
+        # generate wavelength list considering horizontal shift
+        xshift_lst = np.polyval(self.curve_coeff, ycen)
+        wave_lst = np.polyval(self.wave_coeff, allx - xshift_lst)
+     
+        # extract 1d sepectra
+     
+        # summ extraction
+        yy, xx = np.mgrid[:ny, :nx]
+        upper_line = ycen + fwhm_mean
+        lower_line = ycen - fwhm_mean
+        upper_ints = np.int32(np.round(upper_line))
+        lower_ints = np.int32(np.round(lower_line))
+        extmask = (yy > lower_ints) * (yy < upper_ints)
+        mask = np.float32(extmask)
+        # determine the weights in the boundary
+        mask[upper_ints, allx] = (upper_line + 0.5) % 1
+        mask[lower_ints, allx] = 1 - (lower_line + 0.5) % 1
+
+        # extract
+        spec_sum = (data * mask).sum(axis=0)
+        nslit = mask.sum(axis=0)
+
+        # correct image distortion
+        ycen0 = ycen[0:-200].mean()
+        cdata = np.zeros_like(data, dtype=data.dtype)
+        for y in np.arange(ny):
+            row = data[y, :]
+            shift = np.polyval(self.curve_coeff, y) - np.polyval(self.curve_coeff, ycen0)
+            f = intp.InterpolatedUnivariateSpline(allx, row, k=3, ext=3)
+            cdata[y, :] = f(allx + shift)
+
+        # initialize background mask
+        bkgmask = np.zeros_like(data, dtype=bool)
+        for r1, r2 in background_rows:
+            bkgmask[r1:r2, :] = True
+
+        '''
+        # plot image after distortion correction
+        title = 'Curvature Correction for {} ({})'.format(
+                fileid, objname)
+        fig3 = Figure2D(data=cdata, scale=(10, 99), title=title)
+        fig3.ax_image.plot(allx, ycen,
+                           color='C3', ls='-', lw=0.5, alpha=1)
+        fig3.ax_image.plot(allx, upper_line,
+                           color='C3', ls='--', lw=0.5, alpha=1)
+        fig3.ax_image.plot(allx, lower_line,
+                           color='C3', ls='--', lw=0.5, alpha=1)
+        # plot background mask regions
+        for r1, r2 in background_rows:
+            fig3.ax_image.plot(allx, np.repeat(r1, nx),
+                               color='C1', ls='-', lw=0.5, alpha=1)
+            fig3.ax_image.plot(allx, np.repeat(r2, nx),
+                               color='C1', ls='-', lw=0.5, alpha=1)
+        figname = 'loc_curve_{}.png'.format(logitem['fileid'])
+        figfilename = os.path.join(self.figpath, figname)
+        fig3.savefig(figfilename)
+        plt.close(fig3)
+        '''
+
+        # remove cosmic rays in the background region
+        # ori_bkgspec= (cdata*bkgmask).sum(axis=0)/(bkgmask.sum(axis=0))
+     
+        # method 1
+        # for r1, r2 in background_rows:
+        #    cutdata = cdata[r1:r2, :]
+        #    fildata = median_filter(cutdata, (1, 5), mode='nearest')
+        #    resdata = cutdata - fildata
+        #    std = resdata.std()
+        #    mask = (resdata < 3*std)*(resdata > -3*std)
+        #    bkgmask[r1:r2, :] = mask
+     
+        # method 2
+        for r1, r2 in background_rows:
+            bkgmask[r1:r2, :] = True
+            cutdata = cdata[r1:r2, :]
+            mean = cutdata.mean(axis=0)
+            std = cutdata.std()
+            mask = (cutdata < mean + 3 * std) * (cutdata > mean - 3 * std)
+            bkgmask[r1:r2, :] = mask
+
+        # plot the bkg and bkg mask
+        # fig0 = plt.figure()
+        # ax01 = fig0.add_subplot(121)
+        # ax02 = fig0.add_subplot(122)
+        # for r1, r2 in background_rows:
+        #    for y in np.arange(r1, r2):
+        #        ax01.plot(cdata[y, :]+y*15, lw=0.5)
+        #        m = ~bkgmask[y, :]
+        #        ax01.plot(allx[m], cdata[y, :][m]+y*15, 'o', color='C0')
+        # bkgspec = (cdata*bkgmask).sum(axis=0)/(bkgmask.sum(axis=0))
+        # ax02.plot(ori_bkgspec)
+        # ax02.plot(bkgspec)
+        # plt.show()
+     
+        # remove the peaks in the spatial direction
+        # sum of background mask along y
+        bkgmasksum = bkgmask.sum(axis=1)
+        # find positive positions
+        posmask = np.nonzero(bkgmasksum)[0]
+        # initialize crossspec
+        crossspec = np.zeros(ny)
+        crossspec[posmask] = (cdata * bkgmask).sum(axis=1)[posmask] / bkgmasksum[posmask]
+        fitx = ally[posmask]
+        fity = crossspec[posmask]
+        fitmask = np.ones_like(posmask, dtype=np.bool)
+        maxiter = 3
+        for i in range(maxiter):
+            c = np.polyfit(fitx[fitmask], fity[fitmask], deg=2)
+            res_lst = fity - np.polyval(c, fitx)
+            std = res_lst[fitmask].std()
+            new_fitmask = (res_lst > -2 * std) * (res_lst < 2 * std)
+            if new_fitmask.sum() == fitmask.sum():
+                break
+            fitmask = new_fitmask
+     
+        # block these pixels in bkgmask
+        for y in ally[posmask][~fitmask]:
+            bkgmask[y, :] = False
+     
+        # plot the cross-section of background regions
+        fig100 = plt.figure(figsize=(9, 6), dpi=100)
+        ax1 = fig100.add_axes([0.07, 0.54, 0.87, 0.36])
+        ax2 = fig100.add_axes([0.07, 0.12, 0.87, 0.36])
+        newy = np.polyval(c, ally)
+        for ax in fig100.get_axes():
+            ax.plot(ally, cdata.mean(axis=1), alpha=0.3, color='C0', lw=0.7)
+        y1, y2 = ax1.get_ylim()
+     
+        ylst = ally[posmask][fitmask]
+        for idxlst in np.split(ylst, np.where(np.diff(ylst) != 1)[0] + 1):
+            for ax in fig100.get_axes():
+                ax.plot(ally[idxlst], crossspec[idxlst], color='C0', lw=0.7)
+                ax.fill_betweenx([y1, y2], idxlst[0], idxlst[-1],
+                                 facecolor='C2', alpha=0.15)
+     
+        for ax in fig100.get_axes():
+            ax.plot(ally, newy, color='C1', ls='-', lw=0.5)
+     
+        ax2.plot(ally, newy + std, color='C1', ls='--', lw=0.5)
+        ax2.plot(ally, newy - std, color='C1', ls='--', lw=0.5)
+        for ax in fig100.get_axes():
+            ax.set_xlim(0, ny - 1)
+            ax.grid(True, ls='--', lw=0.5)
+            ax.set_axisbelow(True)
+        ax1.set_ylim(y1, y2)
+        ax2.set_ylim(newy.min() - 6 * std, newy.max() + 6 * std)
+        ax2.set_xlabel('Y (pixel)')
+        title = '{} ({})'.format(logitem['fileid'], logitem['object'])
+        fig100.suptitle(title)
+        figname = 'bkg_cross_{}.png'.format(logitem['fileid'])
+        figfilename = os.path.join(self.figpath, figname)
+        fig100.savefig(figfilename)
+        plt.close(fig100)
+     
+        # plot a 2d image of distortion corrected image
+        # and background region
+        fig3 = plt.figure(dpi=100, figsize=(12, 6))
+        ax31 = fig3.add_axes([0.07, 0.1, 0.4, 0.8])
+        ax32 = fig3.add_axes([0.55, 0.1, 0.4, 0.8])
+        vmin = np.percentile(cdata, 10)
+        vmax = np.percentile(cdata, 99)
+        ax31.imshow(cdata, origin='lower', vmin=vmin, vmax=vmax)
+        bkgdata = np.zeros_like(cdata, dtype=cdata.dtype)
+        bkgdata[bkgmask] = cdata[bkgmask]
+        bkgdata[~bkgmask] = (vmin + vmax) / 2
+        ax32.imshow(bkgdata, origin='lower', vmin=vmin, vmax=vmax)
+        for ax in fig3.get_axes():
+            ax.set_xlim(0, nx - 1)
+            ax.set_ylim(0, ny - 1)
+            ax.set_xlabel('X (pixel)')
+            ax.set_ylabel('Y (pixel)')
+        title = '{} ({})'.format(fileid, objname)
+        fig3.suptitle(title)
+        figname = 'bkg_region_{}.png'.format(logitem['fileid'])
+        figfilename = os.path.join(self.figpath, figname)
+        fig3.savefig(figfilename)
+        plt.close(fig3)
+     
+        # background spectra per pixel along spatial direction
+        bkgspec = (cdata * bkgmask).sum(axis=0) / (bkgmask.sum(axis=0))
+        # background spectra in the spectrum aperture
+        background_sum = bkgspec * nslit
+     
+        spec_sum_dbkg = spec_sum - background_sum
+
+
+def find_order_location(data, figfilename, title):
+
+    def errfunc(p, x, y, fitfunc):
+        return y - fitfunc(p, x)
+
+    def fitfunc(p, x):
+        return gaussian(p[0], p[1], p[2], x)+p[3]
+
+
+    ny, nx = data.shape
+    allx = np.arange(nx)
+    ally = np.arange(ny)
+    ymax = data[:,30:250].mean(axis=1).argmax()
+    #print(ymax)
+    xscan_lst = []
+    ycen_lst = []
+    fwhm_lst = []
+
+    xnode_lst = []
+    ynode_lst = []
+
+    # make a plot
+    fig1 = plt.figure(figsize=(12, 8), dpi=100)
+    w1 = 0.39
+    ax1 = fig1.add_axes([0.07, 0.43, 0.39, 0.50])
+    ax2 = fig1.add_axes([0.56, 0.07, w1, 0.22])
+    ax3 = fig1.add_axes([0.07, 0.07, 0.39, 0.30])
+    ax4 = fig1.add_axes([0.56, 0.35, w1, w1 / 2 * 3])
+    offset_mark = 0
+    yc = ymax
+    for ix, x in enumerate(np.arange(30, nx-200, 50)):
+        xdata = ally
+        # ydata = data[:,x]
+        ydata = data[:, x - 20:x + 21].mean(axis=1)
+        y1 = yc - 20
+        y2 = yc + 20
+        yc = ydata[y1:y2].argmax() + y1
+        succ = True
+
+
+        for i in range(2):
+            y1 = yc - 20
+            y2 = yc + 20
+            xfitdata = ally[y1:y2]
+            yfitdata = ydata[y1:y2]
+            p0 = [yfitdata.max() - yfitdata.min(), 6.0, yc, yfitdata.min()]
+
+            mask = np.ones_like(xfitdata, dtype=bool)
+            for j in range(2):
+                fitres = opt.least_squares(errfunc, p0,
+                            bounds=([0,      3,  -np.inf, -np.inf],
+                                    [np.inf, 50, np.inf,  np.inf]),
+                            args=(xfitdata[mask], yfitdata[mask],
+                                                 fitfunc))
+                p = fitres['x']
+                res_lst = errfunc(p, xfitdata, yfitdata, fitfunc)
+                std = res_lst[mask].std()
+                new_mask = (res_lst > -3 * std) * (res_lst < 3 * std)
+                mask = new_mask
+
+            A, fwhm, center, bkg = p
+            if A < 0 or fwhm > 100:
+                succ = False
+                break
+            yc = int(round(center))
+
+        if not succ:
+            continue
+
+        # pack results
+        xscan_lst.append(x)
+        ycen_lst.append(center)
+        fwhm_lst.append(fwhm)
+
+        newx = np.arange(xfitdata[0], xfitdata[-1], 0.1)
+        newy = fitfunc(p, newx)
+
+        # plot fitting in ax1
+        # determine the color
+
+        if offset_mark == 0:
+            offset_rate = A * 0.002
+            offset_mark = 1
+        offset = x * offset_rate
+
+        color = 'C{:d}'.format(ix % 10)
+        ax1.scatter(xfitdata, yfitdata - bkg + offset,
+                    alpha=0.5, s=4, c=color)
+        ax1.plot(newx, newy - bkg + offset,
+                 alpha=0.5, lw=0.5, color=color)
+        ax1.vlines(center, offset, A + offset,
+                   color=color, lw=0.5, alpha=0.5)
+        ax1.hlines(offset, center - fwhm, center + fwhm,
+                   color=color, lw=0.5, alpha=0.5)
+
+        # plot stacked profiles in ax3
+        xprofile = xfitdata - center
+        yprofile = (yfitdata - bkg) / A
+        ax3.plot(xprofile, yprofile, color=color, alpha=0.5, lw=0.5)
+
+        for vx, vy in zip(xprofile, yprofile):
+            xnode_lst.append(vx)
+            ynode_lst.append(vy)
+
+    xscan_lst = np.array(xscan_lst)
+    ycen_lst = np.array(ycen_lst)
+    fwhm_lst = np.array(fwhm_lst)
+
+    # fit the order position with iterative polynomial
+    mask = np.ones_like(xscan_lst, dtype=bool)
+    for i in range(2):
+        coeff_loc = np.polyfit(xscan_lst[mask], ycen_lst[mask], deg=3)
+        res_lst = ycen_lst - np.polyval(coeff_loc, xscan_lst)
+        std = res_lst[mask].std()
+        new_mask = (res_lst < 3 * std) * (res_lst > -3 * std)
+        mask = new_mask
+
+    # final position
+    ycen = np.polyval(coeff_loc, allx)
+
+    # calculate averaged FWHM
+    fwhm_mean, _, _ = get_clip_mean(fwhm_lst)
+
+    # adjust fitting in ax1
+    ax1.set_xlim(ycen_lst.min() - 20, ycen_lst.max() + 20)
+    ax1.set_ylim(-offset_rate * 200, offset_rate * 2500)
+    ax1.set_xlabel('Y (pixel)')
+    ax1.set_ylabel('Flux (with offset)')
+
+    # plot fitted positon in ax2
+    ax2.scatter(xscan_lst, ycen_lst,
+                alpha=0.8, s=20, edgecolor='C0', c='w')
+    ax2.scatter(xscan_lst[mask], ycen_lst[mask],
+                alpha=0.8, s=20, c='C0')
+    ax2.errorbar(xscan_lst, ycen_lst, yerr=fwhm_lst,
+                 fmt='o', capsize=0, ms=0, zorder=-1)
+    ax2.plot(allx, ycen, ls='-', color='C3', lw=1, alpha=0.6)
+    ax2.plot(allx, ycen + std, ls='--', color='C3', lw=1, alpha=0.6)
+    ax2.plot(allx, ycen - std, ls='--', color='C3', lw=1, alpha=0.6)
+    ax2.grid(True, ls='--')
+    ax2.set_axisbelow(True)
+    x1, x2 = 0, nx - 1
+    y1 = (ycen - fwhm_mean * 3).min()
+    y2 = (ycen + fwhm_mean * 3).max()
+    ax2.text(0.95 * x1 + 0.05 * x2, 0.15 * y1 + 0.85 * y2,
+             'Mean FWHM = {:4.2f}'.format(fwhm_mean))
+    ax2.set_xlim(x1, x2)
+    ax2.set_ylim(y1, y2)
+    ax2.set_xlabel('X (pixel)')
+    ax2.set_ylabel('Y (pixel)')
+
+    # calculate average profile
+    xnode_lst = np.array(xnode_lst)
+    ynode_lst = np.array(ynode_lst)
+
+    step = 1
+    xprofile_node_lst = []
+    yprofile_node_lst = []
+    for x in np.arange(-18, 18, step):
+        x1 = x - step / 2
+        x2 = x + step / 2
+        m = (xnode_lst > x1) * (xnode_lst < x2)
+        ymean, _, mask = get_clip_mean(ynode_lst[m])
+        xprofile_node_lst.append(xnode_lst[m][mask].mean())
+        yprofile_node_lst.append(ymean)
+    xprofile_node_lst = np.array(xprofile_node_lst)
+    yprofile_node_lst = np.array(yprofile_node_lst)
+
+    yprofile_node_lst = np.maximum(yprofile_node_lst, 0)
+    interf = intp.InterpolatedUnivariateSpline(
+        xprofile_node_lst, yprofile_node_lst, k=3, ext=1)
+
+    # adjust ax3
+    ax3.plot(xprofile_node_lst, yprofile_node_lst, 'o-',
+             ms=3, color='k', lw=0.5)
+    ax3.set_ylim(-0.5, 1.5)
+    ax3.grid(True, ls='--', lw=0.5)
+    ax3.axvline(0, ls='--', lw=1, color='k')
+    ax3.axhline(0, ls='--', lw=1, color='k')
+    ax3.set_axisbelow(True)
+    ax3.set_xlabel('X (pixel)')
+
+    # plot image data in ax4
+    vmin = np.percentile(data, 10)
+    vmax = np.percentile(data, 99)
+    ax4.imshow(data, origin='lower', vmin=vmin, vmax=vmax)
+    ax4.set_xlim(0, nx - 1)
+    ax4.set_ylim(0, ny - 1)
+    ax4.set_xlabel('X (pixel)')
+    ax4.set_ylabel('Y (pixel)')
+    ax4.plot(allx, ycen, ls='-', color='C3', lw=0.5, alpha=1)
+    ax4.plot(allx, ycen + fwhm_mean, ls='--', color='C3', lw=0.5, alpha=1)
+    ax4.plot(allx, ycen - fwhm_mean, ls='--', color='C3', lw=0.5, alpha=1)
+    # set title
+    fig1.suptitle(title)
+    fig1.savefig(figfilename)
+    plt.close(fig1)
+
+    return coeff_loc, fwhm_mean, interf
+
 
 def group_caliblamps(lamp_item_lst):
     frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]

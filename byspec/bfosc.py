@@ -852,7 +852,8 @@ class _BFOSC(object):
 
         # initialize background mask
         bkgmask = np.zeros_like(data, dtype=bool)
-        background_rows = [(520, 800), (1000, 1250)]  # rows to exctract background
+        # index of rows to exctract background
+        background_rows = [(520, 800), (1000, 1250)]
         for r1, r2 in background_rows:
             bkgmask[r1:r2, :] = True
 

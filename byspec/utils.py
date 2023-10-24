@@ -122,7 +122,7 @@ def get_cloud_url():
     #    # rest of the world
     #    return 'https://byspec.s3.eu-central-1.amazonaws.com/'
 
-    return 'https://byspec.s3.cn-north-1.amazonaws.com.cn/'
+    return 'https://byspec.s3.cn-north-1.amazonaws.com.cn/calib/bfosc/wlcalib_20230418c1278.fits'
 
 
 def get_file(filepath, md5, show_progress=True):

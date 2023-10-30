@@ -69,15 +69,16 @@ def make_obslog(path, display=True):
                '{:8s} {:6s} {:8s} {:8s} {:7s} {:7s} {:7s} {:5s} {:15s}')
     head_str = fmt_str.format('frameid', 'fileid', 'datatype', 'object',
                               'exptime', 'dateobs', 'mode', 'config',
-                              'slit', 'filter', 'binning', 'gain', 'rdnoise', 'q99',
-                              'observer')
+                              'slit', 'filter', 'binning', 'gain', 
+                              'rdnoise', 'q99','observer')
     if display:
         print(head_str)
 
     for fname in sorted(os.listdir(path)):
         if not fname.endswith('.fit'):
             continue
-        mobj = re.match('(\d{12})_([A-Z]+)_(\S*)_(\S*)_(\S*)_(\S*)\.fit', fname)
+        mobj = re.match('(\d{12})_([A-Z]+)_(\S*)_(\S*)_(\S*)_(\S*)\.fit',
+                        fname)
         if not mobj:
             continue
         fileid = np.int64(mobj.group(1))
@@ -154,12 +155,13 @@ def make_obslog(path, display=True):
 
 def get_mosaic_fileid(obsdate, dateobs):
     date = dateutil.parser.parse(obsdate)
-    t0 = datetime.datetime.combine(date, datetime.time(0, 0, 0))
+    t0 = datetime.datetime.combine(date, 
+                                   datetime.time(0, 0, 0))
     t1 = dateutil.parser.parse(dateobs)
     delta_t = t1 - t0
     delta_minutes = int(delta_t.total_seconds() / 60)
-    newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, date.day,
-                                             delta_minutes)
+    newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, 
+                                             date.day,delta_minutes)
     return newid
 
 
@@ -196,39 +198,44 @@ def select_fluxstd_from_database(ra, dec):
     index_file1 = os.path.join(os.path.dirname(__file__),
                                'data/fluxstd/okestan.dat')
     okestan_data = Table.read(index_file1, format='ascii.fixed_width_two_line')
-    index_file2 = os.path.join(os.path.dirname(__file__),
-                               'data/fluxstd/ctiostan.dat')
-    ctiostan_data = Table.read(index_file2, format='ascii.fixed_width_two_line')
 
-    # select the closest fluxstandard
     target_coord = SkyCoord(ra=ra * u.degree, dec=dec * u.degree, frame='icrs')
     filename = None
     found_in_okestan = False
     for row in okestan_data:
-        source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, dec=row['DEJ2000'] * u.degree, frame='icrs')
+        source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
+                                dec=row['DEJ2000'] * u.degree, frame='icrs')
         separation = target_coord.separation(source_coord)
-        if separation < 30 * u.arcsec:
-            print(f"Match found in okestan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
+        if separation < 3 * u.arcsec:
+            print(f"Match found in okestan.dat - Name: {row['filename']}, "
+                  f"MD5: {row['md5_ffile']}")
             fileid = row['filename']
             md5 = row['md5_ffile']
             filepath = os.path.join('fluxstd/okestan/', f'f{fileid}.dat')
             filename = get_file(filepath, md5)
             found_in_okestan = True
-            break  # 结束循环
+            break  
     else:
         print('Not matched in okestan.dat')
 
     if not found_in_okestan:
+        index_file2 = os.path.join(os.path.dirname(__file__),
+                                   'data/fluxstd/ctiostan.dat')
+        ctiostan_data = Table.read(index_file2,
+                                   format='ascii.fixed_width_two_line')
+        
         for row in ctiostan_data:
-            source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, dec=row['DEJ2000'] * u.degree, frame='icrs')
+            source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
+                                    dec=row['DEJ2000'] * u.degree, frame='icrs')
             separation = target_coord.separation(source_coord)
             if separation < 3 * u.arcsec:
-                print(f"Match found in ctiostan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
+                print(f"Match found in ctiostan.dat - Name: {row['filename']}, "
+                      f"MD5: {row['md5_ffile']}")
                 fileid = row['filename']
                 md5 = row['md5_ffile']
                 filepath = os.path.join('fluxstd/ctiostan/', f'f{fileid}.dat')
                 filename = get_file(filepath, md5)
-                break  # 结束循环
+                break  
         else:
             print('Not matched in ctiostan.dat')
 
@@ -241,7 +248,8 @@ def select_fluxstd_from_database(ra, dec):
                 if line:
                     columns = line.split()
                     if len(columns) >= 2:
-                            fluxstd_data.append([np.float64(columns[0]), np.float64(columns[1])])
+                            fluxstd_data.append([np.float64(columns[0]), 
+                                                 np.float64(columns[1])])
 
         return fluxstd_data
     return {}
@@ -380,8 +388,10 @@ class _BFOSC(object):
             flat1d = self.flat_data[y, :]
 
             flat1d_sm, _, mask, std = iterative_savgol_filter(flat1d,
-                                                              winlen=51, order=3,
-                                                              upper_clip=6, lower_clip=6, maxiter=10)
+                                                              winlen=51,order=3,
+                                                              upper_clip=6, 
+                                                              lower_clip=6, 
+                                                              maxiter=10)
             # flat_sens[y, 20:int(nx) - 20] = flat1d / flat1d_sm
             flat_sens[y, :] = flat1d / flat1d_sm
 
@@ -517,8 +527,10 @@ class _BFOSC(object):
 
                 p0 = [ydata.max() - ydata.min(), 3.6, 3.5, ic, ydata.min()]
                 fitres = opt.least_squares(errfunc, p0,
-                                           bounds=([-np.inf, 0.5, 0.1, i1, -np.inf],
-                                                   [np.inf, 20.0, 20.0, i2, ydata.max()]),
+                                           bounds=([-np.inf, 0.5, 0.1, 
+                                                    i1, -np.inf],
+                                                   [np.inf, 20.0, 20.0, 
+                                                    i2, ydata.max()]),
                                            args=(xdata, ydata, fitline),
                                            )
 
@@ -530,7 +542,8 @@ class _BFOSC(object):
                 # plot
                 ix = count_line % ncol
                 iy = nrow - 1 - count_line // ncol
-                axs = fig_lbl.add_axes([0.07 + ix * 0.16, 0.05 + iy * 0.18, 0.12, 0.15])
+                axs = fig_lbl.add_axes([0.07 + ix * 0.16, 0.05 + iy * 0.18, 
+                                        0.12, 0.15])
                 color = 'C0' if linewave < wavebound else 'C3'
                 axs.scatter(xdata, ydata, s=10, alpha=0.6, color=color)
                 newx = np.linspace(i1, i2, 100)
@@ -542,8 +555,8 @@ class _BFOSC(object):
                 _y1, _y2 = axs.get_ylim()
                 _y2 = _y2 + 0.2 * (_y2 - _y1)
                 _text = '{} {} {:9.4f}'.format(element, ion, linewave)
-                axs.text(0.95 * _x1 + 0.05 * _x2, 0.15 * _y1 + 0.85 * _y2, _text,
-                         fontsize=9)
+                axs.text(0.95 * _x1 + 0.05 * _x2, 0.15 * _y1 + 0.85 * _y2,
+                         _text,fontsize=9)
                 axs.set_ylim(_y1, _y2)
                 axs.xaxis.set_major_locator(tck.MultipleLocator(5))
                 axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
@@ -600,7 +613,8 @@ class _BFOSC(object):
             axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
             axt1.set_xticklabels([])
             axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
-            axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+            axt5.plot(pixel_lst[0:-1], 
+                      -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
             axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
             axt5.set_xlabel('Pixel')
             axt5.set_ylabel(u'dv/dx (km/s)')
@@ -1033,14 +1047,7 @@ class _BFOSC(object):
 
         spec_sum_dbkg = spec_sum - background_sum
 
-    def fluxcalib(self):
-        coords = SkyCoord('15:51:59.0', '32:56:53.99', unit=(u.hourangle, u.deg))
 
-        # 将赤经赤纬转化为度
-        ra = coords.ra.degree
-        dec = coords.dec.degree
-        fluxstd_data = select_fluxstd_from_database(ra, dec)
-        return fluxstd_data
 def find_order_location(data, figfilename, title):
     def errfunc(p, x, y, fitfunc):
         return y - fitfunc(p, x)

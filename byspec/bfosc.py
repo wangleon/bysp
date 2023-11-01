@@ -194,18 +194,18 @@ def select_calib_from_database(index_file, dateobs):
     return spec
 
 
-def select_fluxstd_from_database(ra, dec):
+def select_fluxstd_from_database(target_coord):
     index_file1 = os.path.join(os.path.dirname(__file__),
                                'data/fluxstd/okestan.dat')
-    okestan_data = Table.read(index_file1, format='ascii.fixed_width_two_line')
+    okestan_data = Table.read(index_file1, 
+                              format='ascii.fixed_width_two_line')
 
-    target_coord = SkyCoord(ra=ra * u.degree, dec=dec * u.degree, frame='icrs')
     filename = None
     found_in_okestan = False
     for row in okestan_data:
-        source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
+        fluxstd_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
                                 dec=row['DEJ2000'] * u.degree, frame='icrs')
-        separation = target_coord.separation(source_coord)
+        separation = target_coord.separation(fluxstd_coord)
         if separation < 3 * u.arcsec:
             print(f"Match found in okestan.dat - Name: {row['filename']}, "
                   f"MD5: {row['md5_ffile']}")
@@ -225,9 +225,9 @@ def select_fluxstd_from_database(ra, dec):
                                    format='ascii.fixed_width_two_line')
         
         for row in ctiostan_data:
-            source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
+            fluxstd_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
                                     dec=row['DEJ2000'] * u.degree, frame='icrs')
-            separation = target_coord.separation(source_coord)
+            separation = target_coord.separation(fluxstd_coord)
             if separation < 3 * u.arcsec:
                 print(f"Match found in ctiostan.dat - Name: {row['filename']}, "
                       f"MD5: {row['md5_ffile']}")

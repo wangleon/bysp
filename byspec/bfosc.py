@@ -69,16 +69,15 @@ def make_obslog(path, display=True):
                '{:8s} {:6s} {:8s} {:8s} {:7s} {:7s} {:7s} {:5s} {:15s}')
     head_str = fmt_str.format('frameid', 'fileid', 'datatype', 'object',
                               'exptime', 'dateobs', 'mode', 'config',
-                              'slit', 'filter', 'binning', 'gain', 
-                              'rdnoise', 'q99','observer')
+                              'slit', 'filter', 'binning', 'gain', 'rdnoise', 'q99',
+                              'observer')
     if display:
         print(head_str)
 
     for fname in sorted(os.listdir(path)):
         if not fname.endswith('.fit'):
             continue
-        mobj = re.match('(\d{12})_([A-Z]+)_(\S*)_(\S*)_(\S*)_(\S*)\.fit',
-                        fname)
+        mobj = re.match('(\d{12})_([A-Z]+)_(\S*)_(\S*)_(\S*)_(\S*)\.fit', fname)
         if not mobj:
             continue
         fileid = np.int64(mobj.group(1))
@@ -151,19 +150,28 @@ def make_obslog(path, display=True):
     obstable.sort('fileid')
 
     return obstable
+def group_caliblamps(lamp_item_lst):
+    frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
 
-
+    logitem_groups = []
+    for group in consecutive(frameid_lst):
+        logitem_lst = []
+        for frameid in group:
+            for _logitem in lamp_item_lst:
+                if _logitem['frameid'] == frameid:
+                    logitem_lst.append(_logitem)
+                    break
+        logitem_groups.append(logitem_lst)
+    return logitem_groups
 def get_mosaic_fileid(obsdate, dateobs):
     date = dateutil.parser.parse(obsdate)
-    t0 = datetime.datetime.combine(date, 
-                                   datetime.time(0, 0, 0))
+    t0 = datetime.datetime.combine(date, datetime.time(0, 0, 0))
     t1 = dateutil.parser.parse(dateobs)
     delta_t = t1 - t0
     delta_minutes = int(delta_t.total_seconds() / 60)
-    newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, 
-                                             date.day,delta_minutes)
+    newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, date.day,
+                                             delta_minutes)
     return newid
-
 
 def select_calib_from_database(index_file, dateobs):
     calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
@@ -178,7 +186,7 @@ def select_calib_from_database(index_file, dateobs):
     fileid = row['fileid']  # selected fileid
     md5 = row['md5']
 
-    message = 'Select {} from database index as ThAr reference'.format(fileid)
+    message = 'Select {} from database index as FeAr reference'.format(fileid)
     # logger.info(message)
     print(message)
 
@@ -194,27 +202,28 @@ def select_calib_from_database(index_file, dateobs):
     return spec
 
 
-def select_fluxstd_from_database(target_coord):
+def select_fluxstd_from_database(ra, dec):
     index_file1 = os.path.join(os.path.dirname(__file__),
                                'data/fluxstd/okestan.dat')
-    okestan_data = Table.read(index_file1, 
-                              format='ascii.fixed_width_two_line')
+    okestan_data = Table.read(index_file1, format='ascii.fixed_width_two_line')
 
+    # select the closest fluxstandard
+    target_coord = SkyCoord(ra=ra * u.degree, dec=dec * u.degree, frame='icrs')
     filename = None
     found_in_okestan = False
     for row in okestan_data:
-        fluxstd_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
+        source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree,
                                 dec=row['DEJ2000'] * u.degree, frame='icrs')
-        separation = target_coord.separation(fluxstd_coord)
+        separation = target_coord.separation(source_coord)
         if separation < 3 * u.arcsec:
-            print(f"Match found in okestan.dat - Name: {row['filename']}, "
-                  f"MD5: {row['md5_ffile']}")
+            print(
+                f"Match found in okestan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
             fileid = row['filename']
             md5 = row['md5_ffile']
             filepath = os.path.join('fluxstd/okestan/', f'f{fileid}.dat')
             filename = get_file(filepath, md5)
             found_in_okestan = True
-            break  
+            break
     else:
         print('Not matched in okestan.dat')
 
@@ -223,22 +232,20 @@ def select_fluxstd_from_database(target_coord):
                                    'data/fluxstd/ctiostan.dat')
         ctiostan_data = Table.read(index_file2,
                                    format='ascii.fixed_width_two_line')
-        
         for row in ctiostan_data:
-            fluxstd_coord = SkyCoord(ra=row['RAJ2000'] * u.degree, 
+            source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree,
                                     dec=row['DEJ2000'] * u.degree, frame='icrs')
-            separation = target_coord.separation(fluxstd_coord)
+            separation = target_coord.separation(source_coord)
             if separation < 3 * u.arcsec:
-                print(f"Match found in ctiostan.dat - Name: {row['filename']}, "
-                      f"MD5: {row['md5_ffile']}")
+                print(
+                    f"Match found in ctiostan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
                 fileid = row['filename']
                 md5 = row['md5_ffile']
                 filepath = os.path.join('fluxstd/ctiostan/', f'f{fileid}.dat')
                 filename = get_file(filepath, md5)
-                break  
+                break
         else:
             print('Not matched in ctiostan.dat')
-
 
     fluxstd_data = []
     if filename:
@@ -248,11 +255,13 @@ def select_fluxstd_from_database(target_coord):
                 if line:
                     columns = line.split()
                     if len(columns) >= 2:
-                            fluxstd_data.append([np.float64(columns[0]), 
-                                                 np.float64(columns[1])])
+                        fluxstd_data.append(
+                            [np.float64(columns[0]), np.float64(columns[1])])
 
         return fluxstd_data
     return {}
+
+
 class _BFOSC(object):
     def __init__(self, rawdata_path=None, mode=None):
         self.mode = mode
@@ -282,6 +291,23 @@ class _BFOSC(object):
         self.bias_file = os.path.join(self.reduction_path, 'bias.fits')
         self.flat_file = os.path.join(self.reduction_path, 'flat.fits')
         self.sens_file = os.path.join(self.reduction_path, 'sens.fits')
+    def find_calib_groups(self):
+
+        lamp_lst = {}
+        for logitem in self.logtable:
+            if logitem['datatype'] != 'SPECLLAMP':
+                continue
+            _objname = logitem['object']
+            if _objname not in lamp_lst:
+                lamp_lst[_objname] = []
+            lamp_lst[_objname].append(logitem)
+
+        groups = []
+        for lamp, lamp_item_lst in lamp_lst.items():
+            logitem_groups = group_caliblamps(lamp_item_lst)
+            for logitem_lst in logitem_groups:
+                groups.append(logitem_lst)
+        self.calib_groups = groups
 
     def make_obslog(self):
         obstable = make_obslog(self.rawdata_path, display=True)
@@ -388,10 +414,9 @@ class _BFOSC(object):
             flat1d = self.flat_data[y, :]
 
             flat1d_sm, _, mask, std = iterative_savgol_filter(flat1d,
-                                                              winlen=51,order=3,
-                                                              upper_clip=6, 
-                                                              lower_clip=6, 
-                                                              maxiter=10)
+                                                              winlen=51, order=3,
+                                                              upper_clip=6,
+                                                              lower_clip=6, maxiter=10)
             # flat_sens[y, 20:int(nx) - 20] = flat1d / flat1d_sm
             flat_sens[y, :] = flat1d / flat1d_sm
 
@@ -527,10 +552,9 @@ class _BFOSC(object):
 
                 p0 = [ydata.max() - ydata.min(), 3.6, 3.5, ic, ydata.min()]
                 fitres = opt.least_squares(errfunc, p0,
-                                           bounds=([-np.inf, 0.5, 0.1, 
-                                                    i1, -np.inf],
-                                                   [np.inf, 20.0, 20.0, 
-                                                    i2, ydata.max()]),
+                                           bounds=([-np.inf, 0.5, 0.1, i1, -np.inf],
+                                                   [np.inf, 20.0, 20.0, i2,
+                                                    ydata.max()]),
                                            args=(xdata, ydata, fitline),
                                            )
 
@@ -542,8 +566,7 @@ class _BFOSC(object):
                 # plot
                 ix = count_line % ncol
                 iy = nrow - 1 - count_line // ncol
-                axs = fig_lbl.add_axes([0.07 + ix * 0.16, 0.05 + iy * 0.18, 
-                                        0.12, 0.15])
+                axs = fig_lbl.add_axes([0.07 + ix * 0.16, 0.05 + iy * 0.18, 0.12, 0.15])
                 color = 'C0' if linewave < wavebound else 'C3'
                 axs.scatter(xdata, ydata, s=10, alpha=0.6, color=color)
                 newx = np.linspace(i1, i2, 100)
@@ -555,8 +578,8 @@ class _BFOSC(object):
                 _y1, _y2 = axs.get_ylim()
                 _y2 = _y2 + 0.2 * (_y2 - _y1)
                 _text = '{} {} {:9.4f}'.format(element, ion, linewave)
-                axs.text(0.95 * _x1 + 0.05 * _x2, 0.15 * _y1 + 0.85 * _y2,
-                         _text,fontsize=9)
+                axs.text(0.95 * _x1 + 0.05 * _x2, 0.15 * _y1 + 0.85 * _y2, _text,
+                         fontsize=9)
                 axs.set_ylim(_y1, _y2)
                 axs.xaxis.set_major_locator(tck.MultipleLocator(5))
                 axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
@@ -613,8 +636,7 @@ class _BFOSC(object):
             axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
             axt1.set_xticklabels([])
             axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
-            axt5.plot(pixel_lst[0:-1], 
-                      -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+            axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
             axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
             axt5.set_xlabel('Pixel')
             axt5.set_ylabel(u'dv/dx (km/s)')
@@ -641,7 +663,7 @@ class _BFOSC(object):
             figname = 'wavelength_identmap_{}.png'.format(newfileid)
             figfilename = os.path.join(self.figpath, figname)
             fig_imap.savefig(figfilename)
-            plt.show()
+            # plt.show()
             plt.close(fig_imap)
 
             # save wavelength calibration data
@@ -691,32 +713,6 @@ class _BFOSC(object):
 
         # determine the global wavelength coeff
         self.wave_coeff = np.array(coeff_wave_lst).mean(axis=0)
-
-    def plot_wlcalib(self):
-        fig = plt.figure(figsize=(12, 6), dpi=150)
-        ax1 = fig.add_subplot(211)
-        ax2 = fig.add_subplot(212)
-        ax1.plot(self.wavelength, self.calibflux, lw=0.5)
-        ax1.set_xlabel(u'Wavelength (\xc5)')
-        plt.show()
-
-    def find_calib_groups(self):
-
-        lamp_lst = {}
-        for logitem in self.logtable:
-            if logitem['datatype'] != 'SPECLLAMP':
-                continue
-            _objname = logitem['object']
-            if _objname not in lamp_lst:
-                lamp_lst[_objname] = []
-            lamp_lst[_objname].append(logitem)
-
-        groups = []
-        for lamp, lamp_item_lst in lamp_lst.items():
-            logitem_groups = group_caliblamps(lamp_item_lst)
-            for logitem_lst in logitem_groups:
-                groups.append(logitem_lst)
-        self.calib_groups = groups
 
     def find_distortion(self):
 
@@ -813,12 +809,6 @@ class _BFOSC(object):
         # take the average of coeff_lst as final curve_coeff
         self.curve_coeff = np.array(coeff_lst).mean(axis=0)
 
-    def extract_all_science(self):
-        func = lambda item: item['datatype'] == 'SPECLTARGET'
-        logitem_lst = list(filter(func, self.logtable))
-        for logitem in logitem_lst:
-            self.extract(logitem)
-
     def extract(self, arg):
 
         if isinstance(arg, int):
@@ -857,7 +847,7 @@ class _BFOSC(object):
         elif isinstance(arg, Row):
             logitem = arg
         else:
-            print('Unkown target: {}'.format(arg_))
+            print('Unkown target: {}'.format(arg))
             return None
 
         fileid = logitem['fileid']
@@ -911,7 +901,8 @@ class _BFOSC(object):
         cdata = np.zeros_like(data, dtype=data.dtype)
         for y in np.arange(ny):
             row = data[y, :]
-            shift = np.polyval(self.curve_coeff, y) - np.polyval(self.curve_coeff, ycen0)
+            shift = np.polyval(self.curve_coeff, y) - np.polyval(self.curve_coeff,
+                                                                 ycen0)
             f = intp.InterpolatedUnivariateSpline(allx, row, k=3, ext=3)
             cdata[y, :] = f(allx + shift)
 
@@ -963,7 +954,8 @@ class _BFOSC(object):
         posmask = np.nonzero(bkgmasksum)[0]
         # initialize crossspec
         crossspec = np.zeros(ny)
-        crossspec[posmask] = (cdata * bkgmask).sum(axis=1)[posmask] / bkgmasksum[posmask]
+        crossspec[posmask] = (cdata * bkgmask).sum(axis=1)[posmask] / bkgmasksum[
+            posmask]
         fitx = ally[posmask]
         fity = crossspec[posmask]
         fitmask = np.ones_like(posmask, dtype=bool)
@@ -1047,7 +1039,185 @@ class _BFOSC(object):
 
         spec_sum_dbkg = spec_sum - background_sum
 
+        # optimal extraction
+        debkg_data = data - np.repeat([bkgspec], ny, axis=0)
 
+        def errfunc(p, x, y, fitfunc):
+            return y - fitfunc(p, x)
+
+        fitprof_func = lambda p, x: p[0] * profile_func(x) + p[1]
+        f_opt_lst = []
+        b_opt_lst = []
+        for x in np.arange(nx):
+            ycenint = np.int32(np.round(ycen[x]))
+            y1 = ycenint - 18
+            y2 = ycenint + 19
+            fitx = ally[y1:y2] - ycenint
+            flux = data[y1:y2, x]
+            debkg_flux = debkg_data[y1:y2, x]
+            mask = np.ones(y2 - y1, dtype=bool)
+
+            # b0 = (flux[0]+flux[-1])/2
+            b0 = bkgspec[x]
+            p0 = [flux.max() - b0, b0]
+            maxiter = 6
+            for ite in range(maxiter):
+                fitres = opt.least_squares(errfunc, p0,
+                                           args=(fitx[mask], flux[mask], fitprof_func))
+                p = fitres['x']
+                res_lst = errfunc(p, fitx, flux, fitprof_func)
+                std = res_lst[mask].std()
+                new_mask = res_lst < 3 * std
+                if new_mask.sum() == mask.sum():
+                    break
+                mask = new_mask
+            plot_opt_columns = False  # column-by-column figure of optimal extraction
+            ccd_gain = 1.41  # CCD gain (electron/ADU)
+            ccd_ron = 4.64  # CCD readout noise (electron/pixel)
+            # plot the column-by-column fitting figure
+            if plot_opt_columns:
+                nrow = 5
+                ncol = 7
+                if x % (nrow * ncol) == 0:
+                    fig = plt.figure(figsize=(14, 8), dpi=200)
+                iax = x % (nrow * ncol)
+                icol = iax % ncol
+                irow = int(iax / ncol)
+                w1 = 0.95 / ncol
+                w2 = w1 - 0.025
+                h1 = 0.96 / nrow
+                h2 = h1 - 0.025
+                ax = fig.add_axes(
+                    [0.05 + icol * w1, 0.05 + (nrow - irow - 1) * h1, w2, h2])
+                ax.scatter(fitx, flux, c='w', edgecolor='C0', s=15)
+                ax.scatter(fitx[mask], flux[mask], c='C0', s=15)
+                newx = np.arange(y1, y2 + 1e-3, 0.1) - ycenint
+                newy = fitprof_func(p, newx)
+                ax.plot(newx, newy, ls='-', color='C1')
+                ax.plot(newx, newy + std, ls='--', color='C1')
+                ax.plot(newx, newy - std, ls='--', color='C1')
+                ylim1, ylim2 = ax.get_ylim()
+                ax.text(0.95 * fitx[0] + 0.05 * fitx[-1], 0.1 * ylim1 + 0.9 * ylim2,
+                        'X = {:4d}'.format(x))
+                ax.axvline(x=0, c='k', ls='--', lw=0.5)
+                ax.set_ylim(ylim1, ylim2)
+                ax.set_xlim(fitx[0], fitx[-1])
+                if iax == (nrow * ncol - 1) or x == nx - 1:
+                    figname = 'fit_{:d}_{:04d}.png'.format(
+                        logitem['fileid'], x)
+                    figfilename = os.path.join('./reduction/figures', figname)
+                    fig.savefig(figfilename)
+                    plt.close(fig)
+
+            # variance array
+            s_lst = 1 / (np.maximum(flux * ccd_gain, 0) + ccd_ron ** 2)
+            profile = profile_func(fitx)
+            normpro = profile / profile.sum()
+            fopt = ((s_lst * normpro * debkg_flux)[mask].sum()) / \
+                   ((s_lst * normpro ** 2)[mask].sum())
+
+            bkg_flux = np.repeat(bkgspec[x], y2 - y1)
+            bopt = ((s_lst * normpro * bkg_flux)[mask].sum()) / \
+                   ((s_lst * normpro ** 2)[mask].sum())
+            f_opt_lst.append(fopt)
+            b_opt_lst.append(bopt)
+        f_opt_lst = np.array(f_opt_lst)
+        b_opt_lst = np.array(b_opt_lst)
+
+        spec_opt_dbkg = f_opt_lst
+        background_opt = b_opt_lst
+        spec_opt = spec_opt_dbkg + background_opt
+
+        # now:
+        #                      |      sum       |    optimal
+        # ---------------------+----------------+----------------
+        # backgroud:           | background_sum | background_opt
+        # target + background: | spec_sum       | spec_opt
+        # target:              | spec_sum_dbkg  | spec_opt_dbkg
+
+        # save 1d spectra to ascii files
+        fname = 'spec_{}.fits'.format(logitem['fileid'])
+        spec1d_path = './reduction/onedspec'
+        if not os.path.exists(spec1d_path):
+            os.mkdir(spec1d_path)
+        filename = os.path.join(spec1d_path, fname)
+        w = wave_lst[::-1]
+        f1 = spec_opt_dbkg[::-1]
+        f2 = spec_sum_dbkg[::-1]
+        b1 = background_opt[::-1]
+        b2 = background_sum[::-1]
+        t_data = Table([w, f1, b1, f2, b2], names=(
+        'wave_lst', 'spec_opt_dbkg', 'background_opt', 'spec_sum_dbkg',
+        'background_sum'))
+        t_data.write(filename, format='fits', overwrite=True)
+
+        # plot 1d spec and backgrounds
+        fig2 = plt.figure(figsize=(9, 6), dpi=300)
+        ax21 = fig2.add_axes([0.10, 0.55, 0.85, 0.35])
+        ax22 = fig2.add_axes([0.10, 0.10, 0.85, 0.40])
+        ax21.plot(wave_lst, spec_opt, color='C0', lw=0.5,
+                  alpha=0.9, label='Target + Background')
+        ax21.plot(wave_lst, background_opt, color='C1', lw=0.5,
+                  alpha=0.9, label='Background')
+        ax22.plot(wave_lst, spec_opt_dbkg, color='C3', lw=0.5,
+                  alpha=0.9, label='Target')
+        for ax in fig2.get_axes():
+            ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
+            ax.set_axisbelow(True)
+            ax.set_xlim(wave_lst.min(), wave_lst.max())
+            ax.xaxis.set_major_locator(tck.MultipleLocator(1000))
+            ax.xaxis.set_minor_locator(tck.MultipleLocator(100))
+        ax21.legend(loc='upper left')
+        ax22.legend(loc='upper left')
+        ax22.set_xlabel(u'Wavelength (\xc5)')
+        title = 'Spectra of {} ({})'.format(logitem['fileid'], logitem['object'])
+        fig2.suptitle(title)
+        figname = 'spec_{}.png'.format(logitem['fileid'])
+        figfilename = os.path.join(self.figpath, figname)
+        fig2.savefig(figfilename)
+        plt.close(fig2)
+
+        # make a plot of comparison of sum extraction and optimal extraction
+        fig3 = plt.figure(figsize=(9, 6), dpi=300)
+        ax31 = fig3.add_axes([0.10, 0.10, 0.85, 0.8])
+        ax31.plot(wave_lst, spec_sum, color='C1', lw=0.5, alpha=0.9,
+                  label='Sum Extraction')
+        ax31.plot(wave_lst, spec_opt, color='C0', lw=0.5, alpha=0.9,
+                  label='Optimal Extraction')
+        ax31.grid(True, ls='--', lw=0.5)
+        ax31.set_axisbelow(True)
+        ax31.set_xlim(wave_lst.min(), wave_lst.max())
+        ax31.set_xlabel(u'Wavelength (\xc5)')
+        ax31.set_ylabel(u'Count')
+        ax31.xaxis.set_major_locator(tck.MultipleLocator(1000))
+        ax31.xaxis.set_minor_locator(tck.MultipleLocator(100))
+        ax31.legend(loc='upper left')
+        title = 'Extraction Comparison of {} ({})'.format(
+            logitem['fileid'], logitem['object'])
+        fig3.suptitle(title)
+        figname = 'extcomp_{}.png'.format(logitem['fileid'])
+        figfilename = os.path.join(self.figpath, figname)
+        fig3.savefig(figfilename)
+        plt.close(fig3)
+
+    def extract_all_science(self):
+        func = lambda item: item['datatype'] == 'SPECLTARGET'
+        logitem_lst = list(filter(func, self.logtable))
+        for logitem in logitem_lst:
+            self.extract(logitem)
+    # def fluxcalib(self):
+    #     coords = SkyCoord('15:51:59.0', '32:56:53.99', unit=(u.hourangle, u.deg))
+    #     ra = coords.ra.degree
+    #     dec = coords.dec.degree
+    #     fluxstd_data = select_fluxstd_from_database(ra, dec)
+    #     return fluxstd_data
+    # def plot_wlcalib(self):
+    #     fig = plt.figure(figsize=(12, 6), dpi=150)
+    #     ax1 = fig.add_subplot(211)
+    #     ax2 = fig.add_subplot(212)
+    #     ax1.plot(self.wavelength, self.calibflux, lw=0.5)
+    #     ax1.set_xlabel(u'Wavelength (\xc5)')
+    #     plt.show()
 def find_order_location(data, figfilename, title):
     def errfunc(p, x, y, fitfunc):
         return y - fitfunc(p, x)
@@ -1244,21 +1414,5 @@ def find_order_location(data, figfilename, title):
     plt.close(fig1)
 
     return coeff_loc, fwhm_mean, interf
-
-
-def group_caliblamps(lamp_item_lst):
-    frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
-
-    logitem_groups = []
-    for group in consecutive(frameid_lst):
-        logitem_lst = []
-        for frameid in group:
-            for _logitem in lamp_item_lst:
-                if _logitem['frameid'] == frameid:
-                    logitem_lst.append(_logitem)
-                    break
-        logitem_groups.append(logitem_lst)
-    return logitem_groups
-
 
 BFOSC = _BFOSC()

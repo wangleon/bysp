@@ -150,6 +150,8 @@ def make_obslog(path, display=True):
     obstable.sort('fileid')
 
     return obstable
+
+
 def group_caliblamps(lamp_item_lst):
     frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
 
@@ -163,6 +165,8 @@ def group_caliblamps(lamp_item_lst):
                     break
         logitem_groups.append(logitem_lst)
     return logitem_groups
+
+
 def get_mosaic_fileid(obsdate, dateobs):
     date = dateutil.parser.parse(obsdate)
     t0 = datetime.datetime.combine(date, datetime.time(0, 0, 0))
@@ -172,6 +176,7 @@ def get_mosaic_fileid(obsdate, dateobs):
     newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, date.day,
                                              delta_minutes)
     return newid
+
 
 def select_calib_from_database(index_file, dateobs):
     calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
@@ -291,6 +296,7 @@ class _BFOSC(object):
         self.bias_file = os.path.join(self.reduction_path, 'bias.fits')
         self.flat_file = os.path.join(self.reduction_path, 'flat.fits')
         self.sens_file = os.path.join(self.reduction_path, 'sens.fits')
+      
     def find_calib_groups(self):
 
         lamp_lst = {}
@@ -1218,7 +1224,10 @@ class _BFOSC(object):
     #     ax1.plot(self.wavelength, self.calibflux, lw=0.5)
     #     ax1.set_xlabel(u'Wavelength (\xc5)')
     #     plt.show()
+
+
 def find_order_location(data, figfilename, title):
+  
     def errfunc(p, x, y, fitfunc):
         return y - fitfunc(p, x)
 
@@ -1414,5 +1423,6 @@ def find_order_location(data, figfilename, title):
     plt.close(fig1)
 
     return coeff_loc, fwhm_mean, interf
+
 
 BFOSC = _BFOSC()

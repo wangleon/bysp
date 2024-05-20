@@ -183,7 +183,7 @@ def select_calib_from_database(index_file, dateobs):
 
     input_date = dateutil.parser.parse(dateobs)
 
-    # select the closest ThAr
+    # select the closest FeAr
     timediff = [(dateutil.parser.parse(t) - input_date).total_seconds()
                 for t in calibtable['obsdate']]
     irow = np.abs(timediff).argmin()
@@ -368,25 +368,6 @@ class _BFOSC(object):
                              figfilename=figfilename,
                              title=title,
                              )
-
-    def plot_flat(self, show=True):
-        figfilename = os.path.join(self.figpath, 'flat.png')
-        title = 'Flat ({})'.format(os.path.basename(self.flat_file))
-        plot_image_with_hist(self.flat_data,
-                             show=show,
-                             figfilename=figfilename,
-                             title=title,
-                             )
-
-    def plot_sens(self, show=True):
-        figfilename = os.path.join(self.figpath, 'sens.png')
-        title = 'Sensitivity ({})'.format(os.path.basename(self.sens_file))
-        plot_image_with_hist(self.sens_data,
-                             show=show,
-                             figfilename=figfilename,
-                             title=title,
-                             )
-
     def combine_flat(self):
         if os.path.exists(self.flat_file):
             self.flat_data = fits.getdata(self.flat_file)
@@ -429,6 +410,24 @@ class _BFOSC(object):
         fits.writeto(self.sens_file, flat_sens, overwrite=True)
 
         self.sens_data = flat_sens
+      
+    def plot_flat(self, show=True):
+        figfilename = os.path.join(self.figpath, 'flat.png')
+        title = 'Flat ({})'.format(os.path.basename(self.flat_file))
+        plot_image_with_hist(self.flat_data,
+                             show=show,
+                             figfilename=figfilename,
+                             title=title,
+                             )
+
+    def plot_sens(self, show=True):
+        figfilename = os.path.join(self.figpath, 'sens.png')
+        title = 'Sensitivity ({})'.format(os.path.basename(self.sens_file))
+        plot_image_with_hist(self.sens_data,
+                             show=show,
+                             figfilename=figfilename,
+                             title=title,
+                             )
 
     def extract_lamp(self):
         lamp_item_lst = filter(lambda item: item['datatype'] == 'SPECLLAMP',

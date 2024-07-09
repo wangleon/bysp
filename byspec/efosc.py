@@ -481,11 +481,11 @@ class _EFOSC(object):
         filename = os.path.dirname(__file__) + '/data/linelist/HeAr.dat'
         linelist = Table.read(filename, format='ascii.fixed_width_two_line')
 
-        # index_file = os.path.join(os.path.dirname(__file__),
-        #                           'data/calib/wlcalib_efosc.dat')
-        # ref_spec = select_calib_from_database(index_file, self.obsdate)
-        hdu_lst = fits.open('./reduction/wlcalib.fits')
-        ref_spec = hdu_lst[1].data
+        index_file = os.path.join(os.path.dirname(__file__),
+                                  'data/calib/wlcalib_efosc.dat')
+        ref_spec = select_calib_from_database(index_file, self.obsdate)
+        # hdu_lst = fits.open('./reduction/wlcalib.fits')
+        # ref_spec = hdu_lst[1].data
         ref_wave = ref_spec['wavelength']
         ref_flux = ref_spec['flux']
         shift_lst = np.arange(-50, 50)

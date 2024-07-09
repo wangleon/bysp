@@ -32,7 +32,8 @@ def plot_image_with_hist(data, dpi=120, figsize=(10, 6), scale=(5, 95),
     ax_hist1.text(vmin, 0.1*y1+0.9*y2, str(scale[0])+'%')
     ax_hist1.text(vmax, 0.1*y1+0.9*y2, str(scale[1])+'%')
     ax_hist1.set_ylim(y1, y2)
-
+    # ax_hist1.set_yticklabels([])
+    # ax_hist2.set_yticklabels([])
     ax_hist2.hist(data.flatten(), bins=np.linspace(vmin, vmax, 50))
     ax_hist2.set_xlim(vmin, vmax)
     fig.suptitle(title)
@@ -40,7 +41,7 @@ def plot_image_with_hist(data, dpi=120, figsize=(10, 6), scale=(5, 95),
     if figfilename is not None:
         fig.savefig(figfilename)
 
-    if show:
-        plt.show()
+    # if show:
+    #     plt.show()
 
     plt.close(fig)

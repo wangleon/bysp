@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import numpy as np
 
+
 def _combine_clipdata(data, mask=None, mode='mean', upper_clip=None,
                       lower_clip=None, maxiter=10, maskmode=None):
     """Combine a clip data.
@@ -81,6 +82,7 @@ def _combine_clipdata(data, mask=None, mode='mean', upper_clip=None,
         return np.median(mdata, axis=0).data
     else:
         return None
+
 
 def combine_images(data, mask=None, mode='mean', upper_clip=None,
                    lower_clip=None, maxiter=10, maskmode=None, ncores=1):
@@ -172,8 +174,9 @@ def combine_images(data, mask=None, mode='mean', upper_clip=None,
                 clipdata = data[:, y1:y2, x1:x2]
                 clipmask = mask[:, y1:y2, x1:x2]
                 result = pool.apply_async(_combine_clipdata,
-                        args=(clipdata, clipmask, mode, upper_clip, lower_clip,
-                              maxiter, maskmode))
+                                          args=(clipdata, clipmask, mode, upper_clip,
+                                                lower_clip,
+                                                maxiter, maskmode))
                 async_result_lst[(x1, x2, y1, y2)] = result
         # segmentation loop ends here
 
@@ -195,4 +198,3 @@ def combine_images(data, mask=None, mode='mean', upper_clip=None,
         else:
             raise ValueError
             return None
-

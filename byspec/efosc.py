@@ -17,7 +17,8 @@ from utils import get_file
 from imageproc import combine_images
 from onedarray import (iterative_savgol_filter, get_simple_ccf,
                        gaussian, gengaussian,
-                       consecutive, find_shift_ccf, get_clip_mean)
+                       consecutive, polyfit2d, polyval2d,
+                       distortion_fitting, get_clip_mean)
 from visual import plot_image_with_hist
 
 
@@ -28,15 +29,15 @@ def print_wrapper(string, item):
     datatype = item['datatype']
     objname = item['object']
 
-    if datatype == 'BIAS':
+    if datatype == 'DARK':
         # bias, use dim (2)
         return '\033[2m' + string.replace('\033[0m', '') + '\033[0m'
 
-    elif datatype in ['SLITTARGET', 'SPECLTARGET']:
+    elif datatype in ['OBJECT', 'STD']:
         # science targets, use nighlights (1)
         return '\033[1m' + string.replace('\033[0m', '') + '\033[0m'
 
-    elif datatype == 'SPECLLAMP':
+    elif datatype == 'WAVE':
         # lamp, use light yellow (93)
         return '\033[93m' + string.replace('\033[0m', '') + '\033[0m'
 
@@ -46,8 +47,7 @@ def print_wrapper(string, item):
 
 def make_obslog(path, display=True):
     obstable = Table(dtype=[
-        ('frameid', int),
-        ('fileid', np.int64),
+        ('fileid', str),
         ('datatype', str),
         ('object', str),
         ('exptime', float),
@@ -56,93 +56,71 @@ def make_obslog(path, display=True):
         ('DEJ2000', str),
         ('mode', str),
         ('config', str),
-        ('slit', str),
+        ('slit', float),
         ('filter', str),
-        ('binning', str),
+        ('xbin', int),
+        ('ybin', int),
+        ('outid', str),
+        ('rdspeed', str),
         ('gain', float),
         ('rdnoise', float),
         ('q99', int),
         ('observer', str),
     ], masked=True)
 
-    fmt_str = ('  - {:7s} {:12s} {:>12s} {:>16s} {:>7} {:23s}'
-               '{:8s} {:6s} {:8s} {:8s} {:7s} {:7s} {:7s} {:5s} {:15s}')
-    head_str = fmt_str.format('frameid', 'fileid', 'datatype', 'object',
+    fmt_str = ('  - {:24s} {:>12s} {:>16s} {:>8} {:23s}'
+               '{:8s} {:>12s} {:4} {:8s} {:2} {:2} {:4} {:7} {:5s} {:15s}')
+    head_str = fmt_str.format('fileid', 'datatype', 'object',
                               'exptime', 'dateobs', 'mode', 'config',
-                              'slit', 'filter', 'binning', 'gain', 'rdnoise', 'q99',
-                              'observer')
+                              'slit', 'filter', 'xbin', 'ybin',
+                              'gain', 'rdnoise', 'q99', 'observer')
     if display:
         print(head_str)
 
     for fname in sorted(os.listdir(path)):
-        if not fname.endswith('.fit'):
+        if not fname.endswith('.fits'):
             continue
-        mobj = re.match('(\d{12})_([A-Z]+)_(\S*)_(\S*)_(\S*)_(\S*)\.fit', fname)
-        if not mobj:
-            continue
-        fileid = np.int64(mobj.group(1))
-        frameid = int(str(fileid)[8:])
-        datatype = mobj.group(2)
-        objname2 = mobj.group(3)
-        key1 = mobj.group(4)
-        key2 = mobj.group(5)
-        key3 = mobj.group(6)
-
         filename = os.path.join(path, fname)
         data, header = fits.getdata(filename, header=True)
+        fileid = fname.split('.fits')[0]
+        datatype = header['HIERARCH ESO DPR TYPE']
         objname = header['OBJECT']
         exptime = header['EXPTIME']
         dateobs = header['DATE-OBS']
-        ra = header['RA']
-        dec = header['DEC']
-        _filter = header['FILTER']
-        xbinning = header['XBINNING']
-        ybinning = header['YBINNING']
-        gain = header['GAIN']
-        rdnoise = header['RDNOISE']
+        ra = str(header['RA'])
+        dec = str(header['DEC'])
+        mode = header['HIERARCH ESO DET SHUT TYPE']
+        config = header['HIERARCH ESO INS GRIS1 NAME']
+        slit = header['HIERARCH ESO INS SLIT1 NAME'].split('#')[1]
+        filtername = header['HIERARCH ESO INS FILT1 NAME']
+        xbin = header['CDELT1']
+        ybin = header['CDELT2']
+        outid = header['HIERARCH ESO DET OUT1 ID']
+        read_speed = header['HIERARCH ESO DET READ SPEED']
+        gain = header['HIERARCH ESO DET OUT1 GAIN']
+        rdnoise = header['HIERARCH ESO DET OUT1 RON']
         observer = header['OBSERVER']
         q99 = int(np.percentile(data, 99))
 
-        binning = '{}x{}'.format(xbinning, ybinning)
-
-        if re.match('G\d+', key3):
-            mode = 'longslit'
-            config = key3
-            filtername = key2
-        elif re.match('G\d+', key2) and re.match('E\d+', key3):
-            mode = 'echelle'
-            config = '{}+{}'.format(key3, key2)
-            filtername = ''
+        if datatype == 'OBJECT' or datatype == 'STD':
+            obstable.add_row((fileid, datatype, objname, exptime, dateobs,
+                              ra, dec, mode, config, slit, filtername, xbin,
+                              ybin, outid, read_speed, float(gain),
+                              float(rdnoise), q99, observer))
         else:
-            mode = ''
-            config = ''
-            filtername = key2
-
-        if filtername == 'Free':
-            filtername = ''
-
-        # find slit width
-        mobj = re.match('slit(\d+)s?', key1)
-        if mobj:
-            slit = str(int(mobj.group(1)) / 10) + '"'
-        else:
-            slit = ''
-
-        if datatype in ['BIAS', 'SPECLFLAT', 'SPECLLAMP']:
-            ra, dec = '', ''
-
-        obstable.add_row((frameid, fileid, datatype, objname, exptime, dateobs,
-                          ra, dec, mode, config, slit, filtername,
-                          binning, float(gain), float(rdnoise), q99, observer))
-
+            ra = ''
+            dec = ''
+            obstable.add_row((fileid, datatype, objname, exptime, dateobs,
+                              ra, dec, mode, config, slit, filtername,
+                              xbin, ybin, outid, read_speed, float(gain),
+                              float(rdnoise), q99, observer))
         if display:
             logitem = obstable[-1]
 
             string = fmt_str.format(
-                '[{:d}]'.format(frameid), str(fileid),
-                '{:3s}'.format(datatype),
+                str(fileid), datatype,
                 objname, exptime, dateobs[0:23], mode, config,
-                slit, filtername, binning, gain, rdnoise,
+                slit, filtername, xbin, ybin, gain, rdnoise,
                 '{:5d}'.format(q99), observer,
             )
             print(print_wrapper(string, logitem))
@@ -150,6 +128,8 @@ def make_obslog(path, display=True):
     obstable.sort('fileid')
 
     return obstable
+
+
 def group_caliblamps(lamp_item_lst):
     frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
 
@@ -163,6 +143,8 @@ def group_caliblamps(lamp_item_lst):
                     break
         logitem_groups.append(logitem_lst)
     return logitem_groups
+
+
 def get_mosaic_fileid(obsdate, dateobs):
     date = dateutil.parser.parse(obsdate)
     t0 = datetime.datetime.combine(date, datetime.time(0, 0, 0))
@@ -172,6 +154,7 @@ def get_mosaic_fileid(obsdate, dateobs):
     newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, date.day,
                                              delta_minutes)
     return newid
+
 
 def select_calib_from_database(index_file, dateobs):
     calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
@@ -186,11 +169,11 @@ def select_calib_from_database(index_file, dateobs):
     fileid = row['fileid']  # selected fileid
     md5 = row['md5']
 
-    message = 'Select {} from database index as FeAr reference'.format(fileid)
+    message = 'Select {} from database index as HeAr reference'.format(fileid)
     # logger.info(message)
     print(message)
 
-    filepath = os.path.join('calib/bfosc/', 'wlcalib_{}.fits'.format(fileid))
+    filepath = os.path.join('calib/efosc/', 'wlcalib.fits')
     filename = get_file(filepath, md5)
 
     # load spec, calib, and aperset from selected FITS file
@@ -262,7 +245,7 @@ def select_fluxstd_from_database(ra, dec):
     return {}
 
 
-class _BFOSC(object):
+class _EFOSC(object):
     def __init__(self, rawdata_path=None, mode=None):
         self.mode = mode
 
@@ -291,6 +274,7 @@ class _BFOSC(object):
         self.bias_file = os.path.join(self.reduction_path, 'bias.fits')
         self.flat_file = os.path.join(self.reduction_path, 'flat.fits')
         self.sens_file = os.path.join(self.reduction_path, 'sens.fits')
+
     def find_calib_groups(self):
 
         lamp_lst = {}
@@ -335,22 +319,27 @@ class _BFOSC(object):
 
         if os.path.exists(self.bias_file):
             self.bias_data = fits.getdata(self.bias_file)
-
         else:
             print('Combine bias')
             data_lst = []
 
-            bias_item_lst = filter(lambda item: item['datatype'] == 'BIAS',
+            bias_item_lst = filter(lambda item: item['datatype'] == 'DARK',
                                    self.logtable)
 
             for logitem in bias_item_lst:
                 filename = self.fileid_to_filename(logitem['fileid'])
                 data = fits.getdata(filename)
+                data = np.transpose(data)
+                data = data[99:950, 20:970]
+                # data = data[130:2010, 0:2000]
+                mean = np.mean(data[data < 300])
+                mask = data > 500
+                data[mask] = mean
                 data_lst.append(data)
             data_lst = np.array(data_lst)
-
             bias_data = combine_images(data_lst, mode='mean',
-                                       upper_clip=5, maxiter=10, maskmode='max')
+                                       upper_clip=5, lower_clip=5,
+                                       maxiter=10, maskmode='max')
             fits.writeto(self.bias_file, bias_data, overwrite=True)
             self.bias_data = bias_data
 
@@ -363,6 +352,41 @@ class _BFOSC(object):
                              title=title,
                              )
 
+    def combine_flat(self):
+        if os.path.exists(self.flat_file):
+            self.flat_data = fits.getdata(self.flat_file)
+        else:
+            print('Combine Flat')
+            data_lst = []
+
+            flat_item_lst = filter(lambda item: item['datatype'] == 'FLAT',
+                                   self.logtable)
+            for logitem in flat_item_lst:
+                filename = self.fileid_to_filename(logitem['fileid'])
+                data = fits.getdata(filename)
+                data = np.transpose(data)
+                data = data[99:950, 20:970]
+                # data = data[130:2010, 0:2000]
+                ny, nx = data.shape
+                for x_index in np.arange(nx):
+                    x = data[:, x_index]
+                    mean = np.mean(x)
+                    median = np.median(x)
+                    std = np.std(x)
+                    threshold = 3 * std
+                    mask = (x > (median + threshold)) | (
+                            x < (median - threshold))
+                    y = np.arange(x.size)
+                    f = intp.InterpolatedUnivariateSpline(y[~mask], x[~mask], k=2)
+                    data[:, x_index][mask] = f(y[mask])
+                data_lst.append(data)
+            data_lst = np.array(data_lst)
+            flat_data = combine_images(data_lst, mode='mean',
+                                       upper_clip=5, lower_clip=5,
+                                       maxiter=10, maskmode='max')
+            fits.writeto(self.flat_file, flat_data, overwrite=True)
+            self.flat_data = flat_data
+
     def plot_flat(self, show=True):
         figfilename = os.path.join(self.figpath, 'flat.png')
         title = 'Flat ({})'.format(os.path.basename(self.flat_file))
@@ -371,6 +395,50 @@ class _BFOSC(object):
                              figfilename=figfilename,
                              title=title,
                              )
+
+    def get_sens(self):
+        ny, nx = self.flat_data.shape
+        allx = np.arange(nx)
+        ally = np.arange(ny)
+        # x axis is the main-dispersion axis
+        self.ndisp = nx
+        flat_sens = np.ones_like(self.flat_data, dtype=np.float64)
+
+        y, x = np.indices(self.flat_data.shape)
+        x_subsample = x[::10].ravel()
+        y_subsample = y[::10].ravel()
+        z = self.flat_data.ravel()
+        selected_z = []
+
+        for center_x, center_y in zip(x_subsample, y_subsample):
+            start_x = max(center_x - 4, 0)
+            end_x = min(center_x + 5, self.flat_data.shape[1])
+            start_y = max(center_y - 4, 0)
+            end_y = min(center_y + 5, self.flat_data.shape[0])
+
+            neighborhood = self.flat_data[start_y:end_y, start_x:end_x]
+            mean_value = np.mean(neighborhood)
+            selected_z.append(mean_value)
+
+        selected_z = np.array(selected_z)
+
+        x_norm = x_subsample / (self.flat_data.shape[1] - 1)
+        y_norm = y_subsample / (self.flat_data.shape[0] - 1)
+
+        m = polyfit2d(x_norm, y_norm, np.log(selected_z), xorder=3, yorder=2)
+
+        xx, yy = np.meshgrid(np.linspace(0, self.flat_data.shape[1] - 1, nx),
+                             np.linspace(0, self.flat_data.shape[0] - 1, ny))
+
+        xx_norm, yy_norm = xx / (self.flat_data.shape[1] - 1), yy / (
+                    self.flat_data.shape[0] - 1)
+
+        zz = np.exp(polyval2d(xx_norm, yy_norm, m))
+
+        flat_sens = self.flat_data / zz
+        fits.writeto(self.sens_file, flat_sens, overwrite=True)
+
+        self.sens_data = flat_sens
 
     def plot_sens(self, show=True):
         figfilename = os.path.join(self.figpath, 'sens.png')
@@ -381,51 +449,8 @@ class _BFOSC(object):
                              title=title,
                              )
 
-    def combine_flat(self):
-        if os.path.exists(self.flat_file):
-            self.flat_data = fits.getdata(self.flat_file)
-        else:
-            print('Combine Flat')
-            data_lst = []
-
-            flat_item_lst = filter(lambda item: item['datatype'] == 'SPECLFLAT',
-                                   self.logtable)
-            for logitem in flat_item_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                # correct bias
-                data = data - self.bias_data
-                data_lst.append(data)
-            data_lst = np.array(data_lst)
-            flat_data = combine_images(data_lst, mode='mean',
-                                       upper_clip=5, maxiter=10, maskmode='max')
-            fits.writeto(self.flat_file, flat_data, overwrite=True)
-            self.flat_data = flat_data
-
-    def get_sens(self):
-        ny, nx = self.flat_data.shape
-        allx = np.arange(nx)
-        # x axis is the main-dispersion axis
-        self.ndisp = nx
-        flat_sens = np.ones_like(self.flat_data, dtype=np.float64)
-
-        for y in np.arange(ny):
-            # flat1d = self.flat_data[y, 20:int(nx) - 20]
-            flat1d = self.flat_data[y, :]
-
-            flat1d_sm, _, mask, std = iterative_savgol_filter(flat1d,
-                                                              winlen=51, order=3,
-                                                              upper_clip=6,
-                                                              lower_clip=6, maxiter=10)
-            # flat_sens[y, 20:int(nx) - 20] = flat1d / flat1d_sm
-            flat_sens[y, :] = flat1d / flat1d_sm
-
-        fits.writeto(self.sens_file, flat_sens, overwrite=True)
-
-        self.sens_data = flat_sens
-
     def extract_lamp(self):
-        lamp_item_lst = filter(lambda item: item['datatype'] == 'SPECLLAMP',
+        lamp_item_lst = filter(lambda item: item['datatype'] == 'WAVE',
                                self.logtable)
 
         hwidth = 5
@@ -436,6 +461,9 @@ class _BFOSC(object):
             fileid = logitem['fileid']
             filename = self.fileid_to_filename(fileid)
             data = fits.getdata(filename)
+            data = np.transpose(data)
+            data = data[99:950, 20:970]
+            # data = data[130:2010, 0:2000]
             data = data - self.bias_data
             data = data / self.sens_data
 
@@ -450,16 +478,17 @@ class _BFOSC(object):
     def identify_wavelength(self):
         pixel_lst = np.arange(self.ndisp)
 
-        filename = os.path.dirname(__file__) + '/data/linelist/FeAr.dat'
+        filename = os.path.dirname(__file__) + '/data/linelist/HeAr.dat'
         linelist = Table.read(filename, format='ascii.fixed_width_two_line')
-        wavebound = 6907  # wavelength boundary to separate the red and blue
 
-        index_file = os.path.join(os.path.dirname(__file__),
-                                  'data/calib/wlcalib_bfosc.dat')
-        ref_spec = select_calib_from_database(index_file, self.obsdate)
+        # index_file = os.path.join(os.path.dirname(__file__),
+        #                           'data/calib/wlcalib_efosc.dat')
+        # ref_spec = select_calib_from_database(index_file, self.obsdate)
+        hdu_lst = fits.open('./reduction/wlcalib.fits')
+        ref_spec = hdu_lst[1].data
         ref_wave = ref_spec['wavelength']
         ref_flux = ref_spec['flux']
-        shift_lst = np.arange(-100, 100)
+        shift_lst = np.arange(-50, 50)
 
         def errfunc(p, x, y, fitfunc):
             return y - fitfunc(p, x)
@@ -467,344 +496,295 @@ class _BFOSC(object):
         def fitline(p, x):
             return gengaussian(p[0], p[1], p[2], p[3], x) + p[4]
 
+        calib_lst = filter(lambda item: item['datatype'] == 'WAVE',
+                           self.logtable)
+        for logitem in calib_lst:
+            filename = self.fileid_to_filename(logitem['fileid'])
+            fileid = logitem['fileid']
+
         self.wave_solutions = {}
         coeff_wave_lst = []
 
-        for logitem_lst in self.calib_groups:
-            # determine blue and red calib lamp
-            q95_lst = {}
-            for logitem in logitem_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                q95 = np.percentile(data, 95)
-                q95_lst[logitem['fileid']] = q95
-            # sort FeAr lamps with intensity from the smallest to the largest
-            sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
-            bandselect_fileids = {
-                'R': sorted_q95_lst[0][0],  # choose the smallest as red
-                'B': sorted_q95_lst[-1][0],  # choose the largets as blue
-            }
-            print('BLUE:', bandselect_fileids['B'])
-            print('RED:', bandselect_fileids['R'])
+        # use flux to compute ccf
+        flux = self.lamp_spec_lst[fileid]['flux']
+        ccf_lst = get_simple_ccf(flux, ref_flux, shift_lst)
 
-            # use red flux to compute ccf
-            _fileid = bandselect_fileids['R']
-            flux = self.lamp_spec_lst[_fileid]['flux']
-            ccf_lst = get_simple_ccf(flux, ref_flux, shift_lst)
+        # fig = plt.figure()
+        # ax = fig.gca()
+        # ax.plot(shift_lst, ccf_lst, c='C3')
 
-            # fig = plt.figure()
-            # ax = fig.gca()
-            # ax.plot(shift_lst, ccf_lst, c='C3')
+        pixel_corr = shift_lst[ccf_lst.argmax()]
+        # print('pixel_corr = {}'.format(pixel_corr))
 
-            pixel_corr = shift_lst[ccf_lst.argmax()]
-            # print(pixel_corr)
+        # fig2 = plt.figure()
+        # ax2 = fig2.gca()
+        # ax2.plot(flux_mosaic)
+        # plt.show()
 
-            # mosaic red and blue
-            fileid_R = bandselect_fileids['R']
-            fileid_B = bandselect_fileids['B']
-            flux_R = self.lamp_spec_lst[fileid_R]['flux']
-            flux_B = self.lamp_spec_lst[fileid_B]['flux']
-            norm_R = np.percentile(flux_R, 10)
-            norm_B = np.percentile(flux_B, 10)
-            flux_mosaic = np.zeros(self.ndisp, dtype=np.float32)
+        wave_lst = []
+        center_lst = []
+
+        fig_lbl = plt.figure(figsize=(15, 6), dpi=150)
+        nrow, ncol = 2, 4
+        count_line = 0
+        total_width = ncol * 0.2 + (ncol - 1) * 0.04  
+        total_height = nrow * 0.3 + (nrow - 1) * 0.2  
+
+        left_margin = (1 - total_width) / 2  
+        bottom_margin = (1 - total_height) / 2  
+
+        width = 0.2
+        height = 0.3
+        for row in linelist:
+            linewave = row['wavelength']
+            element = row['element']
+            # ion = row['ion']
             if ref_wave[0] > ref_wave[-1]:
                 # reverse wavelength order
-                idx = ref_wave.size - np.searchsorted(ref_wave[::-1], wavebound)
-                idx = idx + pixel_corr
-                mask = pixel_lst < idx
+                ic = self.ndisp - np.searchsorted(ref_wave[::-1], linewave)
             else:
-                idx = np.searchsorted(ref_wave, wavebound)
-                idx = idx + pixel_corr
-                mask = pixel_lst > idx
-            flux_mosaic[mask] = flux_R[mask] / norm_R
-            flux_mosaic[~mask] = flux_B[~mask] / norm_B
+                ic = np.searchsorted(ref_wave, linewave)
+            ic = ic + pixel_corr
+            i1, i2 = ic - 9, ic + 10
+            xdata = np.arange(i1, i2)
+            ydata = flux[xdata]
 
-            # get new fileid
-            for _logitem in self.logtable:
-                if _logitem['fileid'] in [fileid_R, fileid_B]:
-                    dateobs = _logitem['dateobs']
-            newfileid = get_mosaic_fileid(self.obsdate, dateobs)
+            p0 = [ydata.max() - ydata.min(), 3.6, 3.5, ic, ydata.min()]
+            fitres = opt.least_squares(errfunc, p0,
+                                       bounds=([-np.inf, 0.5, 0.1, i1, -np.inf],
+                                               [np.inf, 20.0, 20.0, i2,
+                                                ydata.max()]),
+                                       args=(xdata, ydata, fitline),
+                                       )
 
-            # fig2 = plt.figure()
-            # ax2 = fig2.gca()
-            # ax2.plot(flux_mosaic)
-            # plt.show()
+            param = fitres['x']
+            A, alpha, beta, center, bkg = param
+            center_lst.append(center)
+            wave_lst.append(linewave)
 
-            wave_lst = []
-            center_lst = []
+            # plot
 
-            fig_lbl = plt.figure(figsize=(15, 8), dpi=150)
-            nrow, ncol = 5, 6
-            count_line = 0
-            for row in linelist:
-                linewave = row['wavelength']
-                element = row['element']
-                ion = row['ion']
-                if ref_wave[0] > ref_wave[-1]:
-                    # reverse wavelength order
-                    ic = self.ndisp - np.searchsorted(ref_wave[::-1], linewave)
-                else:
-                    ic = np.searchsorted(ref_wave, linewave)
-                ic = ic + pixel_corr
-                i1, i2 = ic - 9, ic + 10
-                xdata = np.arange(i1, i2)
-                ydata = flux_mosaic[xdata]
+            ix = count_line % ncol
+            iy = nrow - 1 - count_line // ncol
+            left = left_margin + ix * (width + 0.04)  
+            bottom = bottom_margin + iy * (height + 0.2) 
 
-                p0 = [ydata.max() - ydata.min(), 3.6, 3.5, ic, ydata.min()]
-                fitres = opt.least_squares(errfunc, p0,
-                                           bounds=([-np.inf, 0.5, 0.1, i1, -np.inf],
-                                                   [np.inf, 20.0, 20.0, i2,
-                                                    ydata.max()]),
-                                           args=(xdata, ydata, fitline),
-                                           )
+            axs = fig_lbl.add_axes([left, bottom, width, height])
+            color = 'C0'
+            axs.scatter(xdata, ydata, s=10, alpha=0.6, color=color)
+            newx = np.linspace(i1, i2, 100)
+            newy = fitline(param, newx)
+            axs.plot(newx, newy, ls='-', color='C1', lw=1, alpha=0.7)
+            axs.axvline(x=center, color='k', ls='--', lw=0.7)
+            axs.set_xlim(newx[0], newx[-1])
+            _x1, _x2 = axs.get_xlim()
+            _y1, _y2 = axs.get_ylim()
+            _y2 = _y2 + 0.2 * (_y2 - _y1)
+            _text = '{} {:9.4f}'.format(element, linewave)
+            # _text = '{} {} {:9.4f}'.format(element, ion, linewave)
+            axs.text(0.95 * _x1 + 0.05 * _x2, 0.15 * _y1 + 0.85 * _y2, _text,
+                     fontsize=9)
+            axs.set_ylim(_y1, _y2)
+            axs.xaxis.set_major_locator(tck.MultipleLocator(5))
+            axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
+            for tick in axs.yaxis.get_major_ticks():
+                tick.label1.set_fontsize(9)
 
-                param = fitres['x']
-                A, alpha, beta, center, bkg = param
-                center_lst.append(center)
-                wave_lst.append(linewave)
+            count_line += 1
+        title = 'Line-by-line fitting'
+        fig_lbl.suptitle(title)
+        figname = 'wavelength_ident.png'
+        figfilename = os.path.join(self.figpath, figname)
+        fig_lbl.savefig(figfilename)
+        plt.close(fig_lbl)
 
-                # plot
-                ix = count_line % ncol
-                iy = nrow - 1 - count_line // ncol
-                axs = fig_lbl.add_axes([0.07 + ix * 0.16, 0.05 + iy * 0.18, 0.12, 0.15])
-                color = 'C0' if linewave < wavebound else 'C3'
-                axs.scatter(xdata, ydata, s=10, alpha=0.6, color=color)
-                newx = np.linspace(i1, i2, 100)
-                newy = fitline(param, newx)
-                axs.plot(newx, newy, ls='-', color='C1', lw=1, alpha=0.7)
-                axs.axvline(x=center, color='k', ls='--', lw=0.7)
-                axs.set_xlim(newx[0], newx[-1])
-                _x1, _x2 = axs.get_xlim()
-                _y1, _y2 = axs.get_ylim()
-                _y2 = _y2 + 0.2 * (_y2 - _y1)
-                _text = '{} {} {:9.4f}'.format(element, ion, linewave)
-                axs.text(0.95 * _x1 + 0.05 * _x2, 0.15 * _y1 + 0.85 * _y2, _text,
-                         fontsize=9)
-                axs.set_ylim(_y1, _y2)
-                axs.xaxis.set_major_locator(tck.MultipleLocator(5))
-                axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
-                for tick in axs.yaxis.get_major_ticks():
-                    tick.label1.set_fontsize(9)
+        ######
+        # fit wavelength solution
+        wave_lst = np.array(wave_lst)
+        center_lst = np.array(center_lst)
 
-                count_line += 1
-            title = 'Line-by-line fitting of {}'.format(newfileid)
-            fig_lbl.suptitle(title)
-            figname = 'wavelength_ident_{}.png'.format(newfileid)
-            figfilename = os.path.join(self.figpath, figname)
-            fig_lbl.savefig(figfilename)
-            plt.close(fig_lbl)
+        idx = center_lst.argsort()
+        center_lst = center_lst[idx]
+        wave_lst = wave_lst[idx]
 
-            ######
-            # fit wavelength solution
-            wave_lst = np.array(wave_lst)
-            center_lst = np.array(center_lst)
+        coeff_wave = np.polyfit(center_lst, wave_lst, deg=5)
+        allwave = np.polyval(coeff_wave, pixel_lst)
+        fitwave = np.polyval(coeff_wave, center_lst)
+        reswave = wave_lst - fitwave
+        stdwave = reswave.std()
+        # append coeff
+        coeff_wave_lst.append(coeff_wave)
 
-            idx = center_lst.argsort()
-            center_lst = center_lst[idx]
-            wave_lst = wave_lst[idx]
+        # plot wavelength solution
+        fig_sol = plt.figure(figsize=(12, 6), dpi=300)
+        axt1 = fig_sol.add_axes([0.07, 0.40, 0.44, 0.52])
+        axt2 = fig_sol.add_axes([0.07, 0.10, 0.44, 0.26])
+        axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
+        axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
+        axt1.plot(center_lst, wave_lst, 'o', ms=4)
+        axt1.plot(pixel_lst, allwave)
+        axt2.plot(center_lst, reswave, 'o', ms=4)
+        axt2.axhline(y=0, color='k', ls='--')
+        axt2.axhline(y=stdwave, color='k', ls='--', alpha=0.4)
+        axt2.axhline(y=-stdwave, color='k', ls='--', alpha=0.4)
+        for ax in fig_sol.get_axes():
+            ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
+            ax.set_axisbelow(True)
+            ax.set_xlim(0, self.ndisp - 1)
+        y1, y2 = axt2.get_ylim()
+        axt2.text(0.03 * self.ndisp, 0.2 * y1 + 0.8 * y2,
+                  u'RMS = {:5.3f} \xc5'.format(stdwave))
+        axt2.set_ylim(y1, y2)
+        axt2.set_xlabel('Pixel')
+        axt1.set_ylabel(u'\u03bb (\xc5)')
+        axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
+        axt1.set_xticklabels([])
+        axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
+        axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+        axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
+        axt5.set_xlabel('Pixel')
+        axt5.set_ylabel(u'dv/dx (km/s)')
+        title = 'Wavelength Solution'
+        fig_sol.suptitle(title)
+        figname = 'wavelength_solution.png'
+        figfilename = os.path.join(self.figpath, figname)
+        fig_sol.savefig(figfilename)
+        plt.close(fig_sol)
 
-            coeff_wave = np.polyfit(center_lst, wave_lst, deg=5)
-            allwave = np.polyval(coeff_wave, pixel_lst)
-            fitwave = np.polyval(coeff_wave, center_lst)
-            reswave = wave_lst - fitwave
-            stdwave = reswave.std()
-            # append coeff
-            coeff_wave_lst.append(coeff_wave)
+        fig_imap = plt.figure(dpi=200)
+        ax_imap1 = fig_imap.add_subplot(211)
+        ax_imap2 = fig_imap.add_subplot(212)
+        ax_imap1.plot(allwave, flux, lw=0.5)
+        _y1, _y2 = ax_imap1.get_ylim()
+        ax_imap1.vlines(wave_lst, _y1, _y2, color='k', lw=0.5, ls='--')
+        ax_imap1.set_ylim(_y1, _y2)
+        ax_imap2.plot(allwave, pixel_lst, lw=0.5)
+        for ax in fig_imap.get_axes():
+            ax.grid(True, ls='--', lw=0.5)
+            ax.set_axisbelow(True)
+            ax.set_xlim(allwave[0], allwave[-1])
+        ax_imap2.set_xlabel(u'Wavelength (\xc5)')
+        figname = 'wavelength_identmap.png'
+        figfilename = os.path.join(self.figpath, figname)
+        fig_imap.savefig(figfilename)
+        # plt.show()
+        plt.close(fig_imap)
 
-            # plot wavelength solution
-            fig_sol = plt.figure(figsize=(12, 6), dpi=300)
-            axt1 = fig_sol.add_axes([0.07, 0.40, 0.44, 0.52])
-            axt2 = fig_sol.add_axes([0.07, 0.10, 0.44, 0.26])
-            axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
-            axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
-            axt1.plot(center_lst, wave_lst, 'o', ms=4)
-            axt1.plot(pixel_lst, allwave)
-            axt2.plot(center_lst, reswave, 'o', ms=4)
-            axt2.axhline(y=0, color='k', ls='--')
-            axt2.axhline(y=stdwave, color='k', ls='--', alpha=0.4)
-            axt2.axhline(y=-stdwave, color='k', ls='--', alpha=0.4)
-            for ax in fig_sol.get_axes():
-                ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
-                ax.set_axisbelow(True)
-                ax.set_xlim(0, self.ndisp - 1)
-            y1, y2 = axt2.get_ylim()
-            axt2.text(0.03 * self.ndisp, 0.2 * y1 + 0.8 * y2,
-                      u'RMS = {:5.3f} \xc5'.format(stdwave))
-            axt2.set_ylim(y1, y2)
-            axt2.set_xlabel('Pixel')
-            axt1.set_ylabel(u'\u03bb (\xc5)')
-            axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
-            axt1.set_xticklabels([])
-            axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
-            axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
-            axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
-            axt5.set_xlabel('Pixel')
-            axt5.set_ylabel(u'dv/dx (km/s)')
-            title = 'Wavelength Solution for {}'.format(newfileid)
-            fig_sol.suptitle(title)
-            figname = 'wavelength_solution_{}.png'.format(newfileid)
-            figfilename = os.path.join(self.figpath, figname)
-            fig_sol.savefig(figfilename)
-            plt.close(fig_sol)
+        # save wavelength calibration data
+        data = Table(dtype=[
+            ('wavelength', np.float64),
+            ('flux', np.float32),
+        ])
+        for _w, _f in zip(allwave, flux):
+            data.add_row((_w, _f))
+        head = fits.Header()
+        head['OBJECT'] = 'HeAr'
+        head['TELESCOP'] = 'ESO-NTT '
+        head['INSTRUME'] = 'EFOSC   '
+        head['FILEID'] = 'wlcalib_' + logitem['fileid']
+        head['INSTMODE'] = logitem['mode']
+        head['CONFIG'] = logitem['config']
+        head['NDISP'] = self.ndisp
+        head['SLIT'] = logitem['slit']
+        head['FILTER'] = logitem['filter']
+        head['XBINNING'] = logitem['xbin']
+        head['YBINNING'] = logitem['ybin']
+        head['GAIN'] = logitem['gain']
+        head['RDNOISE'] = logitem['rdnoise']
+        head['OBSERVER'] = logitem['observer']
+        hdulst = fits.HDUList([
+            fits.PrimaryHDU(header=head),
+            fits.BinTableHDU(data=data),
+        ])
+        fname = 'wlcalib.fits'
+        filename = os.path.join(self.reduction_path, fname)
+        hdulst.writeto(filename, overwrite=True)
 
-            fig_imap = plt.figure(dpi=200)
-            ax_imap1 = fig_imap.add_subplot(211)
-            ax_imap2 = fig_imap.add_subplot(212)
-            ax_imap1.plot(allwave, flux_mosaic, lw=0.5)
-            _y1, _y2 = ax_imap1.get_ylim()
-            ax_imap1.vlines(wave_lst, _y1, _y2, color='k', lw=0.5, ls='--')
-            ax_imap1.set_ylim(_y1, _y2)
-            ax_imap2.plot(allwave, pixel_lst, lw=0.5)
-            for ax in fig_imap.get_axes():
-                ax.grid(True, ls='--', lw=0.5)
-                ax.set_axisbelow(True)
-                ax.set_xlim(allwave[0], allwave[-1])
-            ax_imap2.set_xlabel(u'Wavelength (\xc5)')
-            figname = 'wavelength_identmap_{}.png'.format(newfileid)
-            figfilename = os.path.join(self.figpath, figname)
-            fig_imap.savefig(figfilename)
-            # plt.show()
-            plt.close(fig_imap)
+        ident_list = Table(dtype=[
+            ('wavelength', np.float64),
+            ('element', str),
+            ('ion', str),
+            ('pixel', np.float32),
+            ('residual', np.float64),
+            ('use', int),
+        ])
 
-            # save wavelength calibration data
-            data = Table(dtype=[
-                ('wavelength', np.float64),
-                ('flux', np.float32),
-            ])
-            for _w, _f in zip(allwave, flux_mosaic):
-                data.add_row((_w, _f))
-            head = fits.Header()
-            head['OBJECT'] = 'FeAr'
-            head['TELESCOP'] = 'Xinglong 2.16m'
-            head['INSTRUME'] = 'BFOSC'
-            head['FILEID'] = newfileid
-            head['MOSAICED'] = True
-            head['NMOSAIC'] = 2
-            head['WAVEBD'] = wavebound,
-            head['FILEID1'] = fileid_B,
-            head['FILEID2'] = fileid_R,
-            head['INSTMODE'] = logitem['mode']
-            head['CONFIG'] = logitem['config']
-            head['NDISP'] = self.ndisp
-            head['SLIT'] = logitem['slit']
-            head['FILTER'] = logitem['filter']
-            head['BINNING'] = logitem['binning']
-            head['GAIN'] = logitem['gain']
-            head['RDNOISE'] = logitem['rdnoise']
-            head['OBSERVER'] = logitem['observer']
-            hdulst = fits.HDUList([
-                fits.PrimaryHDU(header=head),
-                fits.BinTableHDU(data=data),
-            ])
-            fname = 'wlcalib_{}.fits'.format(newfileid)
-            filename = os.path.join(self.reduction_path, fname)
-            hdulst.writeto(filename, overwrite=True)
-
-            ident_list = Table(dtype=[
-                ('wavelength', np.float64),
-                ('element', str),
-                ('ion', str),
-                ('pixel', np.float32),
-                ('residual', np.float64),
-                ('use', int),
-            ])
-
-            self.wave_solutions[newfileid] = allwave
+        self.wave_solutions[logitem['fileid']] = allwave
 
         # determine the global wavelength coeff
         self.wave_coeff = np.array(coeff_wave_lst).mean(axis=0)
 
     def find_distortion(self):
 
-        wavebound = 6907
-        coeff_lst = {}
-
-        fig_dist = plt.figure(figsize=(8, 6), dpi=100)
-        ax_dist = fig_dist.add_axes([0.1, 0.1, 0.85, 0.8])
-
         coeff_lst = []
 
-        for logitem_lst in self.calib_groups:
-            q95_lst = {}
-            for logitem in logitem_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                q95 = np.percentile(data, 95)
-                q95_lst[logitem['fileid']] = q95
-            sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
-            bandselect_fileids = {
-                'R': sorted_q95_lst[0][0],  # choose the smallest as red
-                'B': sorted_q95_lst[-1][0],  # choose the largets as blue
-            }
+        wave_item_lst = filter(lambda item: item['datatype'] == 'WAVE',
+                               self.logtable)
+        for logitem in wave_item_lst:
+            filename = self.fileid_to_filename(logitem['fileid'])
+            data = fits.getdata(filename)
+            data = np.transpose(data)
+            data = data[99:950, 20:970]
+            # data = data[130:2010, 0:2000]
+            data = data - self.bias_data
+            data = data / self.sens_data
+            ny, nx = data.shape
+            allx = np.arange(nx)
+            ally = np.arange(ny)
+            hwidth = 5
+            ref_spec = data[ny // 2 - hwidth:ny // 2 + hwidth, :].sum(axis=0)
+            xcoord = allx
+            xcoord_lst = []
+            ycoord_lst = []
+            xshift_lst = []
 
-            allwave = list(self.wave_solutions.values())[0]
-            for band in ['B', 'R']:
-                fileid = bandselect_fileids[band]
-                filename = self.fileid_to_filename(fileid)
-                data = fits.getdata(filename)
-                data = data - self.bias_data
-                data = data / self.sens_data
-                ny, nx = data.shape
-                allx = np.arange(nx)
-                ally = np.arange(ny)
-                hwidth = 5
-                ref_spec = data[ny // 2 - hwidth:ny // 2 + hwidth, :].sum(axis=0)
-                if band == 'R':
-                    mask = allwave > wavebound
-                else:
-                    mask = allwave < wavebound
-                ref_spec = ref_spec[mask]
-                xcoord = allx[mask]
-                ycoord_lst = []
-                xshift_lst = []
+            fig_distortion = plt.figure(dpi=100, figsize=(8, 6))
+            ax01 = fig_distortion.add_axes([0.1, 0.55, 0.85, 0.36])
+            ax02 = fig_distortion.add_axes([0.1, 0.10, 0.85, 0.36])
+            fig_dist = plt.figure(figsize=(8, 6), dpi=100)
+            ax_dist = fig_dist.add_axes([0.1, 0.1, 0.85, 0.8])
+            for i, y in enumerate(np.arange(70, ny - 70, 70)):
+                spec = data[y - hwidth:y + hwidth, :].sum(axis=0)
+                a, b, c = distortion_fitting(ref_spec, spec)
 
-                fig_distortion = plt.figure(dpi=100, figsize=(8, 6))
-                ax01 = fig_distortion.add_axes([0.1, 0.55, 0.85, 0.36])
-                ax02 = fig_distortion.add_axes([0.1, 0.10, 0.85, 0.36])
-                for i, y in enumerate(np.arange(100, ny - 100, 200)):
-                    spec = data[y - hwidth:y + hwidth, :].sum(axis=0)
-                    spec = spec[mask]
-                    shift = find_shift_ccf(ref_spec, spec)
-                    ycoord_lst.append(y)
-                    xshift_lst.append(shift)
-                    if i == 0:
-                        ax01.plot(xcoord, spec, color='w', lw=0)
-                        y1, y2 = ax01.get_ylim()
-                        offset = (y2 - y1) / 20
-                    ax02.plot(xcoord - shift, spec + offset * i, lw=0.5)
-                    ax01.plot(xcoord, spec + offset * i, lw=0.5)
-                ax01.set_xlim(xcoord[0], xcoord[-1])
-                ax02.set_xlim(xcoord[0], xcoord[-1])
-                ax02.set_xlabel('Pixel')
-                # fig.suptitle('{}'.format(fileid))
-                figname = 'distortion_{}.png'.format(band)
-                figfilename = os.path.join(self.figpath, figname)
-                fig_distortion.savefig(figfilename)
-                plt.close(fig_distortion)
+                def shift(x):
+                    x = np.array(x)
+                    return a * x ** 2 + b * x + c
 
-                coeff = np.polyfit(ycoord_lst, xshift_lst, deg=2)
-                # append to results
+                ycoord_lst.append(y)
+                xshift_lst.append(shift(allx))
+                for row, x in enumerate(np.arange(0, nx, 50)):
+                    xcoord_lst.append(x)
+                coeff = np.polyfit(xcoord_lst, shift(xcoord_lst), deg=3)
                 coeff_lst.append(coeff)
+                ax_dist.plot(xcoord_lst, shift(xcoord_lst), 'o', alpha=0.7)
+                ax_dist.plot(allx, np.polyval(coeff, allx), alpha=0.7)
+                if i == 0:
+                    ax01.plot(xcoord, spec, color='w', lw=0)
+                    y1, y2 = ax01.get_ylim()
+                    offset = (y2 - y1) / 20
+                ax02.plot(xcoord + shift(xcoord), spec + offset * i, lw=0.5)
+                ax01.plot(xcoord, spec + offset * i, lw=0.5)
+            ax01.set_xlim(xcoord[0], xcoord[-1])
+            ax02.set_xlim(xcoord[0], xcoord[-1])
+            ax02.set_xlabel('Pixel')
+            # fig.suptitle('{}'.format(fileid))
+            figname = 'distortion.png'
+            figfilename = os.path.join(self.figpath, figname)
+            fig_distortion.savefig(figfilename)
+            plt.close(fig_distortion)
 
-                color = {'B': 'C0', 'R': 'C3'}[band]
-                sign = {'B': '<', 'R': '>'}[band]
-                label = u'(\u03bb {} {} \xc5)'.format(sign, wavebound)
-                ax_dist.plot(xshift_lst, ycoord_lst, 'o', c=color,
-                             alpha=0.7, label=label)
-                ax_dist.plot(np.polyval(coeff, ally), ally, color=color,
-                             alpha=0.7)
-        ax_dist.axhline(y=ny // 2, ls='-', color='k', lw=0.7)
-        ax_dist.set_ylim(0, ny - 1)
-        ax_dist.xaxis.set_major_locator(tck.MultipleLocator(1))
-        ax_dist.set_xlabel('Shift (pixel)')
-        ax_dist.set_ylabel('Y (pixel)')
-        ax_dist.grid(True, ls='--')
-        ax_dist.set_axisbelow(True)
-        ax_dist.legend(loc='upper left')
-        figname = 'distortion_fitting.png'
-        figfilename = os.path.join(self.figpath, figname)
-        fig_dist.savefig(figfilename)
-        plt.close(fig_dist)
+            # ax_dist.axhline(y=ny // 2, ls='-', color='k', lw=0.7)
+            # ax_dist.set_ylim(0, ny - 1)
+            # ax_dist.xaxis.set_major_locator(tck.MultipleLocator(1))
+            ax_dist.set_ylabel('Shift (pixel)')
+            ax_dist.set_xlabel('X (pixel)')
+            ax_dist.grid(True, ls='--')
+            ax_dist.set_axisbelow(True)
+            figname = 'distortion_fitting.png'
+            figfilename = os.path.join(self.figpath, figname)
+            fig_dist.savefig(figfilename)
+            plt.close(fig_dist)
 
         # take the average of coeff_lst as final curve_coeff
         self.curve_coeff = np.array(coeff_lst).mean(axis=0)
@@ -813,11 +793,14 @@ class _BFOSC(object):
 
         if isinstance(arg, int):
             if arg > 19000000:
-                func = lambda item: item['datatype'] == 'SPECLTARGET' \
+                func = lambda item: (item['datatype'] == 'OBJECT'
+                                     or item['datatype'] == 'STD') \
                                     and item['fileid'] == arg
+
                 logitem_lst = list(filter(func, self.logtable))
             else:
-                func = lambda item: item['datatype'] == 'SPECLTARGET' \
+                func = lambda item: (item['datatype'] == 'OBJECT'
+                                     or item['datatype'] == 'STD') \
                                     and item['frameid'] == arg
                 logitem_lst = list(filter(func, self.logtable))
 
@@ -830,8 +813,8 @@ class _BFOSC(object):
             else:
                 logitem = logitem_lst[0]
         elif isinstance(arg, str):
-
-            func = lambda item: item['datatype'] == 'SPECLTARGET' \
+            func = lambda item: (item['datatype'] == 'OBJECT'
+                                 or item['datatype'] == 'STD') \
                                 and item['object'].lower() == arg.strip().lower()
             logitem_lst = list(filter(func, self.logtable))
 
@@ -856,7 +839,9 @@ class _BFOSC(object):
         print('* FileID: {} - 1d spectra extraction'.format(fileid))
         filename = self.fileid_to_filename(fileid)
         data = fits.getdata(filename)
-
+        data = np.transpose(data)
+        data = data[99:950, 20:970]
+        # data = data[130:2010, 0:2000]
         data = data - self.bias_data
         data = data / self.sens_data
 
@@ -875,7 +860,7 @@ class _BFOSC(object):
         ycen = np.polyval(coeff_loc, allx)
 
         # generate wavelength list considering horizontal shift
-        xshift_lst = np.polyval(self.curve_coeff, ycen)
+        xshift_lst = np.polyval(self.curve_coeff, allx)
         wave_lst = np.polyval(self.wave_coeff, allx - xshift_lst)
 
         # extract 1d sepectra
@@ -897,19 +882,20 @@ class _BFOSC(object):
         nslit = mask.sum(axis=0)
 
         # correct image distortion
-        ycen0 = ycen[0:-200].mean()
+        ycen0 = ycen.mean()
         cdata = np.zeros_like(data, dtype=data.dtype)
         for y in np.arange(ny):
             row = data[y, :]
-            shift = np.polyval(self.curve_coeff, y) - np.polyval(self.curve_coeff,
-                                                                 ycen0)
+            # mask = row < 0
+            # print(np.sum(mask))
+            shift = np.polyval(self.curve_coeff, allx)
             f = intp.InterpolatedUnivariateSpline(allx, row, k=3, ext=3)
-            cdata[y, :] = f(allx + shift)
+            cdata[y, :] = f(allx - shift)
 
         # initialize background mask
         bkgmask = np.zeros_like(data, dtype=bool)
         # index of rows to exctract background
-        background_rows = [(520, 800), (1000, 1250)]
+        background_rows = [(50, 400), (500, 800)]
         for r1, r2 in background_rows:
             bkgmask[r1:r2, :] = True
 
@@ -961,7 +947,7 @@ class _BFOSC(object):
         fitmask = np.ones_like(posmask, dtype=bool)
         maxiter = 3
         for i in range(maxiter):
-            c = np.polyfit(fitx[fitmask], fity[fitmask], deg=2)
+            c = np.polyfit(fitx[fitmask], fity[fitmask], deg=3)
             res_lst = fity - np.polyval(c, fitx)
             std = res_lst[fitmask].std()
             new_fitmask = (res_lst > -2 * std) * (res_lst < 2 * std)
@@ -1034,6 +1020,8 @@ class _BFOSC(object):
 
         # background spectra per pixel along spatial direction
         bkgspec = (cdata * bkgmask).sum(axis=0) / (bkgmask.sum(axis=0))
+        bkgspec_mask = bkgspec < 0
+        bkgspec[bkgspec_mask] = 0
         # background spectra in the spectrum aperture
         background_sum = bkgspec * nslit
 
@@ -1072,7 +1060,7 @@ class _BFOSC(object):
                     break
                 mask = new_mask
             plot_opt_columns = False  # column-by-column figure of optimal extraction
-            ccd_gain = 2.2  # CCD gain (electron/ADU)
+            ccd_gain = 0.91  # CCD gain (electron/ADU)
             ccd_ron = 7.8  # CCD readout noise (electron/pixel)
             # plot the column-by-column fitting figure
             if plot_opt_columns:
@@ -1112,6 +1100,7 @@ class _BFOSC(object):
             # variance array
             s_lst = 1 / (np.maximum(flux * ccd_gain, 0) + ccd_ron ** 2)
             profile = profile_func(fitx)
+            # print(profile)
             normpro = profile / profile.sum()
             fopt = ((s_lst * normpro * debkg_flux)[mask].sum()) / \
                    ((s_lst * normpro ** 2)[mask].sum())
@@ -1137,7 +1126,7 @@ class _BFOSC(object):
 
         # save 1d spectra to ascii files
         fname = 'spec_{}.fits'.format(logitem['fileid'])
-        spec1d_path = './reduction/bfosc/onedspec'
+        spec1d_path = './reduction/efosc/onedspec'
         if not os.path.exists(spec1d_path):
             os.mkdir(spec1d_path)
         filename = os.path.join(spec1d_path, fname)
@@ -1147,8 +1136,8 @@ class _BFOSC(object):
         b1 = background_opt[::-1]
         b2 = background_sum[::-1]
         t_data = Table([w, f1, b1, f2, b2], names=(
-        'wave_lst', 'spec_opt_dbkg', 'background_opt', 'spec_sum_dbkg',
-        'background_sum'))
+            'wave_lst', 'spec_opt_dbkg', 'background_opt', 'spec_sum_dbkg',
+            'background_sum'))
         t_data.write(filename, format='fits', overwrite=True)
 
         # plot 1d spec and backgrounds
@@ -1191,7 +1180,7 @@ class _BFOSC(object):
         ax31.set_ylabel(u'Count')
         ax31.xaxis.set_major_locator(tck.MultipleLocator(1000))
         ax31.xaxis.set_minor_locator(tck.MultipleLocator(100))
-        ax31.legend(loc='upper left')
+        ax31.legend(loc='upper right')
         title = 'Extraction Comparison of {} ({})'.format(
             logitem['fileid'], logitem['object'])
         fig3.suptitle(title)
@@ -1201,10 +1190,11 @@ class _BFOSC(object):
         plt.close(fig3)
 
     def extract_all_science(self):
-        func = lambda item: item['datatype'] == 'SPECLTARGET'
+        func = lambda item: (item['datatype'] == 'OBJECT' or item['datatype'] == 'STD')
         logitem_lst = list(filter(func, self.logtable))
         for logitem in logitem_lst:
             self.extract(logitem)
+
     # def fluxcalib(self):
     #     coords = SkyCoord('15:51:59.0', '32:56:53.99', unit=(u.hourangle, u.deg))
     #     ra = coords.ra.degree
@@ -1218,6 +1208,8 @@ class _BFOSC(object):
     #     ax1.plot(self.wavelength, self.calibflux, lw=0.5)
     #     ax1.set_xlabel(u'Wavelength (\xc5)')
     #     plt.show()
+
+
 def find_order_location(data, figfilename, title):
     def errfunc(p, x, y, fitfunc):
         return y - fitfunc(p, x)
@@ -1228,7 +1220,7 @@ def find_order_location(data, figfilename, title):
     ny, nx = data.shape
     allx = np.arange(nx)
     ally = np.arange(ny)
-    ymax = data[:, 30:250].mean(axis=1).argmax()
+    ymax = data[:, 30:200].mean(axis=1).argmax()
     # print(ymax)
     xscan_lst = []
     ycen_lst = []
@@ -1246,10 +1238,10 @@ def find_order_location(data, figfilename, title):
     ax4 = fig1.add_axes([0.56, 0.35, w1, w1 / 2 * 3])
     offset_mark = 0
     yc = ymax
-    for ix, x in enumerate(np.arange(30, nx - 200, 50)):
+    for ix, x in enumerate(np.arange(30, nx - 100, 30)):
         xdata = ally
         # ydata = data[:,x]
-        ydata = data[:, x - 20:x + 21].mean(axis=1)
+        ydata = data[:, x - 10:x + 11].mean(axis=1)
         y1 = yc - 20
         y2 = yc + 20
         yc = ydata[y1:y2].argmax() + y1
@@ -1340,7 +1332,7 @@ def find_order_location(data, figfilename, title):
 
     # adjust fitting in ax1
     ax1.set_xlim(ycen_lst.min() - 20, ycen_lst.max() + 20)
-    ax1.set_ylim(-offset_rate * 200, offset_rate * 2500)
+    ax1.set_ylim(-offset_rate * 200, offset_rate * 1000)
     ax1.set_xlabel('Y (pixel)')
     ax1.set_ylabel('Flux (with offset)')
 
@@ -1415,4 +1407,5 @@ def find_order_location(data, figfilename, title):
 
     return coeff_loc, fwhm_mean, interf
 
-BFOSC = _BFOSC()
+
+EFOSC = _EFOSC()

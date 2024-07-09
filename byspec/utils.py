@@ -4,6 +4,7 @@ import time
 import hashlib
 import urllib.request
 
+
 def get_file_md5(filename):
     """Get md5 string of file.
 
@@ -18,6 +19,7 @@ def get_file_md5(filename):
     m.update(infile.read())
     infile.close()
     return m.hexdigest()
+
 
 def download_file(url, filename, show_progress=True):
     """Download file from the given url.
@@ -51,47 +53,48 @@ def download_file(url, filename, show_progress=True):
         if second < 60:
             return '{:02d}s'.format(int(second))
 
-        minute = int(second/60)
-        second = second - minute*60
+        minute = int(second / 60)
+        second = second - minute * 60
         if minute < 60:
             return '{:d}m{:02d}s'.format(minute, int(second))
 
-        hour = int(minute/60)
-        minute = minute - hour*60
+        hour = int(minute / 60)
+        minute = minute - hour * 60
         if hour < 24:
             return '{:d}h{:02d}m'.format(hour, int(minute))
 
-        day = int(hour/24)
-        hour = hour - day*24
+        day = int(hour / 24)
+        hour = hour - day * 24
         return '{:d}d{:02d}h'.format(day, int(hour))
 
     def callback(block_num, block_size, total_size):
         t1 = time.time()
         # downloaded size in byte
         down_size = block_num * block_size
-        speed = (down_size - param[1])/(t1-param[0])
+        speed = (down_size - param[1]) / (t1 - param[0])
         if speed > 0:
             # ETA in seconds
-            eta = (total_size - down_size)/speed
+            eta = (total_size - down_size) / speed
             eta = get_human_readable_time(eta)
         else:
             eta = '--'
-        ratio = min(down_size/total_size, 1.0)
-        percent = min(ratio*100., 100)
+        ratio = min(down_size / total_size, 1.0)
+        percent = min(ratio * 100., 100)
 
         disp_speed, unit_speed = get_human_readable_size(speed)
-        disp_size,  unit_size  = get_human_readable_size(total_size)
+        disp_size, unit_size = get_human_readable_size(total_size)
 
         # get the width of the terminal
-        term_size = os.get_terminal_size()
+        # term_size = os.get_terminal_size()
+        term_size = os.terminal_size((80, 24))
 
         str1 = 'Downloading {}'.format(os.path.basename(filename))
         str2 = '{:6.2f}% of {:6.1f} {}'.format(percent, disp_size, unit_size)
         str3 = '{:6.1f} {}/s'.format(disp_speed, unit_speed)
         str4 = 'ETA: {}'.format(eta)
 
-        n = term_size.columns-len(str1)-len(str2)-len(str3)-len(str4)-20
-        progbar = '>'*int(ratio*n)
+        n = term_size.columns - len(str1) - len(str2) - len(str3) - len(str4) - 20
+        progbar = '>' * int(ratio * n)
         progbar = progbar.ljust(n, '-')
 
         msg = '\r {} |{}| {} {} {}'.format(str1, progbar, str2, str3, str4)
@@ -106,18 +109,19 @@ def download_file(url, filename, show_progress=True):
     else:
         urllib.request.urlretrieve(url, filename)
 
+
 def get_cloud_url():
     """Get the url of gamse cloud.
 
     """
 
-    #tz = time.timezone//3600
-    #if tz==-8:
+    # tz = time.timezone//3600
+    # if tz==-8:
     #    # UTC+8, probably in China
     #    # connect amazon aws china
     #    # aliyun url: 'https://gamse.oss-cn-beijing.aliyuncs.com/'
     #    return 'https://byspec.s3.cn-north-1.amazonaws.com.cn/'
-    #else:
+    # else:
     #    # rest of the world
     #    return 'https://byspec.s3.eu-central-1.amazonaws.com/'
 
@@ -140,12 +144,12 @@ def get_file(filepath, md5, show_progress=True):
     url = os.path.join(gamse_url, filepath)
 
     if os.path.exists(filename):
-        if get_file_md5(filename)==md5:
+        if get_file_md5(filename) == md5:
             return filename
         else:
             # file need to be updated
             download_file(url, filename, show_progress=show_progress)
-            if get_file_md5(filename)==md5:
+            if get_file_md5(filename) == md5:
                 return filename
             else:
                 # the file downloaded from the remote server does not match
@@ -154,7 +158,7 @@ def get_file(filepath, md5, show_progress=True):
                 return None
     else:
         download_file(url, filename, show_progress=show_progress)
-        if get_file_md5(filename)==md5:
+        if get_file_md5(filename) == md5:
             return filename
         else:
             # the file downloaded from the remote server does not match

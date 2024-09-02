@@ -10,7 +10,7 @@ from astropy.table import Table, Row
 import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tck
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, Angle
 from astropy import units as u
 
 from utils import get_file
@@ -150,6 +150,8 @@ def make_obslog(path, display=True):
     obstable.sort('fileid')
 
     return obstable
+
+
 def group_caliblamps(lamp_item_lst):
     frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
 
@@ -163,6 +165,8 @@ def group_caliblamps(lamp_item_lst):
                     break
         logitem_groups.append(logitem_lst)
     return logitem_groups
+
+
 def get_mosaic_fileid(obsdate, dateobs):
     date = dateutil.parser.parse(obsdate)
     t0 = datetime.datetime.combine(date, datetime.time(0, 0, 0))
@@ -172,6 +176,7 @@ def get_mosaic_fileid(obsdate, dateobs):
     newid = '{:4d}{:02d}{:02d}c{:4d}'.format(date.year, date.month, date.day,
                                              delta_minutes)
     return newid
+
 
 def select_calib_from_database(index_file, dateobs):
     calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
@@ -208,14 +213,15 @@ def select_fluxstd_from_database(ra, dec):
     okestan_data = Table.read(index_file1, format='ascii.fixed_width_two_line')
 
     # select the closest fluxstandard
-    target_coord = SkyCoord(ra=ra * u.degree, dec=dec * u.degree, frame='icrs')
+    target_coord = SkyCoord(ra=ra, dec=dec, frame='icrs', unit=(u.hourangle, u.deg))
+    print(target_coord)
     filename = None
     found_in_okestan = False
     for row in okestan_data:
         source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree,
                                 dec=row['DEJ2000'] * u.degree, frame='icrs')
         separation = target_coord.separation(source_coord)
-        if separation < 3 * u.arcsec:
+        if separation < 12 * u.arcsec:
             print(
                 f"Match found in okestan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
             fileid = row['filename']
@@ -236,7 +242,7 @@ def select_fluxstd_from_database(ra, dec):
             source_coord = SkyCoord(ra=row['RAJ2000'] * u.degree,
                                     dec=row['DEJ2000'] * u.degree, frame='icrs')
             separation = target_coord.separation(source_coord)
-            if separation < 3 * u.arcsec:
+            if separation < 12 * u.arcsec:
                 print(
                     f"Match found in ctiostan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
                 fileid = row['filename']
@@ -251,15 +257,354 @@ def select_fluxstd_from_database(ra, dec):
     if filename:
         with open(filename) as file:
             for line in file:
-                line = line.strip()
-                if line:
-                    columns = line.split()
-                    if len(columns) >= 2:
-                        fluxstd_data.append(
-                            [np.float64(columns[0]), np.float64(columns[1])])
-
+                columns = line.strip().split()
+                if len(columns) >= 2:
+                    fluxstd_data.append([np.float64(columns[0]), np.float64(columns[1])])
+        fluxstd_data = np.array(fluxstd_data)
         return fluxstd_data
     return {}
+
+
+def find_echelle_apertures(data, align_deg, scan_step):
+    ny, nx = data.shape
+    allx = np.arange(nx)
+    ally = np.arange(ny)
+
+    logdata = np.log10(np.maximum(data, 1))
+
+    x0 = nx // 2
+    x_lst = {-1: [], 1: []}
+    x1 = x0
+    direction = -1
+    icol = 0
+
+    csec_i1 = -ny // 2
+    csec_i2 = ny + ny // 2
+    csec_lst = np.zeros(csec_i2 - csec_i1)
+    csec_nlst = np.zeros(csec_i2 - csec_i1, dtype=np.int32)
+
+    param_lst = {-1: [], 1: []}
+    nodes_lst = {}
+
+    def forward(x, p):
+        deg = len(p) - 1  # determine the polynomial degree
+        res = p[0]
+        for i in range(deg):
+            res = res * x + p[i + 1]
+        return res
+
+    def forward_der(x, p):
+        deg = len(p) - 1  # determine the polynomial degree
+        p_der = [(deg - i) * p[i] for i in range(deg)]
+        return forward(x, p_der)
+
+    def backward(y, p):
+        x = y
+        for ite in range(20):
+            dy = forward(x, p) - y
+            y_der = forward_der(x, p)
+            dx = dy / y_der
+            x = x - dx
+            if (abs(dx) < 1e-7).all():
+                break
+        return x
+
+    def fitfunc(p, interfunc, n):
+        return interfunc(forward(np.arange(n), p[0:-1])) + p[-1]
+
+    def resfunc(p, interfunc, flux0, mask=None):
+        res_lst = flux0 - fitfunc(p, interfunc, flux0.size)
+        if mask is None:
+            mask = np.ones_like(flux0, dtype=bool)
+        return res_lst[mask]
+
+    def find_shift(flux0, flux1, deg):
+        # p0 = [1.0, 0.0, 0.0]
+        # p0 = [0.0, 1.0, 0.0, 0.0]
+        # p0 = [0.0, 0.0, 1.0, 0.0, 0.0]
+
+        p0 = [0.0 for i in range(deg + 1)]
+        p0[-3] = 1.0
+
+        interfunc = intp.InterpolatedUnivariateSpline(
+            np.arange(flux1.size), flux1, k=3, ext=3)
+        mask = np.ones_like(flux0, dtype=bool)
+        clipping = 5.
+        for i in range(10):
+            p, _ = opt.leastsq(resfunc, p0, args=(interfunc, flux0, mask))
+            res_lst = resfunc(p, interfunc, flux0)
+            std = res_lst.std()
+            mask1 = res_lst < clipping * std
+            mask2 = res_lst > -clipping * std
+            new_mask = mask1 * mask2
+            if new_mask.sum() == mask.sum():
+                break
+            mask = new_mask
+        return p, mask
+
+    while (True):
+        nodes_lst[x1] = []
+
+        flux1 = logdata[:, x1]
+        linflux1 = np.median(data[:, x1 - 2:x1 + 3], axis=1)
+
+        if icol == 0:
+            flux1_center = flux1
+
+            # the middle column
+            i1 = 0 - csec_i1
+            i2 = ny - csec_i1
+            # stack the linear flux to the stacked cross-section
+            csec_lst[i1:i2] += linflux1
+            csec_nlst[i1:i2] += 1
+
+        else:
+            param, _ = find_shift(flux0, flux1, deg=align_deg)
+            param_lst[direction].append(param[0:-1])
+            ysta, yend = 0., ny - 1.
+            for param in param_lst[direction][::-1]:
+                ysta = backward(ysta, param)
+                yend = backward(yend, param)
+            # interpolate the new crosssection
+            ynew = np.linspace(ysta, yend, ny)
+            interfunc = intp.InterpolatedUnivariateSpline(ynew, linflux1, k=3)
+            #
+            ysta_int = int(round(ysta))
+            yend_int = int(round(yend))
+            fnew = interfunc(np.arange(ysta_int, yend_int + 1))
+            i1 = ysta_int - csec_i1
+            i2 = yend_int + 1 - csec_i1
+            csec_lst[i1:i2] += fnew
+            csec_nlst[i1:i2] += 1
+
+        x1 += direction * scan_step
+        if x1 <= 10:
+            direction = +1
+            x1 = x0 + direction * scan_step
+            x_lst[direction].append(x1)
+            flux0 = flux1_center
+            icol += 1
+            continue
+        elif x1 >= nx - 10:
+            # scan ends
+            break
+        else:
+            x_lst[direction].append(x1)
+            flux0 = flux1
+            icol += 1
+            continue
+    #
+    i_nonzero = np.nonzero(csec_nlst)[0]
+    istart, iend = i_nonzero[0], i_nonzero[-1]
+    csec_ylst = np.arange(csec_lst.size) + csec_i1
+
+    x = csec_ylst[istart:iend]
+    y = csec_lst[istart:iend]
+    x = x[100:-30]
+    y = y[100:-30]
+    n = y.size
+
+    #########################
+    # cross-section stacking
+    # fig = plt.figure()
+    # ax1 = fig.add_subplot(211)
+    # ax2 = fig.add_subplot(212)
+    # for x0 in np.arange(nx//2, nx, 100):
+    #    ax1.plot(data[:,x0], lw=0.5)
+    # ax1.set_yscale('log')
+    # ax2.plot(x, y, lw=0.5)
+    # ax2.set_yscale('log')
+
+    ############################
+
+    winmask = np.zeros_like(y, dtype=bool)
+    xnodes = [100, 1100]
+    wnodes = [30, 240]
+    snodes = [20, 220]
+    c1 = np.polyfit(xnodes, wnodes, deg=len(xnodes) - 1)
+    c2 = np.polyfit(xnodes, snodes, deg=len(xnodes) - 1)
+    get_winlen = lambda x: np.polyval(c1, x)
+    get_gaplen = lambda x: np.polyval(c2, x)
+    for i1 in np.arange(0, n):
+        winlen = get_winlen(i1)
+        gaplen = get_gaplen(i1)
+        gaplen = max(gaplen, 5)
+        percent = gaplen / winlen * 100
+        i2 = i1 + int(winlen)
+        if i2 >= n - 1:
+            break
+        v = np.percentile(y[i1:i2], percent)
+        pick = y[i1:i2] > v
+        if (~pick).sum() == 0:
+            pick[pick.argmin()] = False
+        idx = np.nonzero(pick)[0]
+        winmask[idx + i1] = True
+
+    bkgmask = ~winmask
+    maxiter = 10
+    for ite in range(maxiter):
+        c = np.polyfit(x[bkgmask], np.log(y[bkgmask]), deg=15)
+        newy = np.polyval(c, x)
+        resy = np.log(y) - newy
+        std = resy[bkgmask].std()
+        newbkgmask = resy < 2 * std
+        if newbkgmask.sum() == bkgmask.sum():
+            break
+        bkgmask = newbkgmask
+
+    aper_mask = y > np.exp(newy + 3 * std)
+    aper_idx = np.nonzero(aper_mask)[0]
+
+    gap_mask = ~aper_mask
+    gap_idx = np.nonzero(gap_mask)[0]
+
+    max_order_width = 120
+    min_order_width = 3
+
+    order_index_lst = []
+    for group in np.split(aper_idx, np.where(np.diff(aper_idx) > 3)[0] + 1):
+        i1 = group[0]
+        i2 = group[-1]
+        if i2 - i1 > max_order_width or i2 - i1 < min_order_width:
+            continue
+        chunk = y[i1:i2]
+        m = chunk > (chunk.max() * 0.3 + chunk.min() * 0.7)
+        i11 = np.nonzero(m)[0][0] + i1
+        i22 = np.nonzero(m)[0][-1] + i1
+        order_index_lst.append((i11, i22))
+
+    norder = len(order_index_lst)
+    order_lst = np.arange(norder)
+    order_cen_lst = np.array([(i1 + i2) / 2 for i1, i2 in order_index_lst])
+    goodmask = np.zeros(norder, dtype=bool)
+    goodmask[0:10] = True
+
+    ### find good orders
+    # fig3 = plt.figure()
+    # ax31 = fig3.add_subplot(211)
+    # ax32 = fig3.add_subplot(212)
+    # ax31.plot(order_lst[goodmask], order_cen_lst[goodmask], 'o', c='C0')
+    # ax31.plot(order_lst[~goodmask], order_cen_lst[~goodmask], 'o', c='none', mec='C0')
+    for i in range((~goodmask).sum()):
+        fintp = intp.InterpolatedUnivariateSpline(
+            np.arange(goodmask.sum()), order_cen_lst[goodmask], k=3)
+        newcen = fintp(goodmask.sum())
+        # ax31.axhline(newcen, color='k', ls='--')
+        min_order = None
+        min_dist = 9999
+        for iorder, cen in enumerate(order_cen_lst):
+            if abs(cen - newcen) < min_dist:
+                min_dist = abs(cen - newcen)
+                min_order = iorder
+        goodmask[min_order] = True
+        if newcen > order_cen_lst[-1]:
+            break
+    # ax31.plot(order_lst[goodmask], order_cen_lst[goodmask], 'o', c='C0', ms=2)
+
+    fig2 = plt.figure(dpi=300)
+    ax2 = fig2.gca()
+    ax2.plot(x, y, label='Profile', lw=0.5)
+    # ax2.plot(x[aper_idx], y[aper_idx], 'o', ms=1)
+    ax2.plot(x, np.exp(newy), label='Background', ls='-')
+    ax2.plot(x, np.exp(newy + 3 * std), label='bkg+3' + '\u03C3', ls='--')
+    _y1, _y2 = ax2.get_ylim()
+    label_good_added = False
+    label_ghost_added = False
+    for iorder, (i1, i2) in enumerate(order_index_lst):
+        if goodmask[iorder]:
+            color = 'C0'
+            label = 'Good Order'
+        else:
+            color = 'C1'
+            label = 'Ghost'
+        ax2.fill_betweenx([_y1, _y2], x[i1], x[i2], color=color, alpha=0.1, lw=0)
+        if label == 'Good Order' and not label_good_added:
+            ax2.fill_betweenx([_y1, _y2], x[i1], x[i2], color=color, label=label,
+                              alpha=0.1, lw=0)
+            label_good_added = True
+        elif label == 'Ghost' and not label_ghost_added:
+            ax2.fill_betweenx([_y1, _y2], x[i1], x[i2], color=color, label=label,
+                              alpha=0.1, lw=0)
+            label_ghost_added = True
+
+    ax2.set_yscale('log')
+    ax2.set_xlabel('Y(pixel)')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Order Profile')
+    ax2.legend(loc='upper left', fontsize=6)
+    ax2.set_ylim(_y1, _y2)
+    fig2.savefig('./reduction/bfosc_echelle/figures/Order Profile.png')
+
+    fig = plt.figure(dpi=300)
+    ax = fig.add_subplot(111)
+    ax = fig.gca()
+    ax.imshow(np.log10(data))
+    fig.subplots_adjust(bottom=0.2)
+    coeff_lst = []
+    label_good_added = False
+    label_ghost_added = False
+    for iorder, (i1, i2) in enumerate(order_index_lst):
+        cen = (x[i1] + x[i2]) / 2
+        xnode_lst = [x0]
+        ynode_lst = [cen]
+        for direction in [-1, 1]:
+            cen1 = cen
+            for icol, param in enumerate(param_lst[direction]):
+                cen1 = forward(cen1, param)
+                xcol = x_lst[direction][icol]
+                xnode_lst.append(xcol)
+                ynode_lst.append(cen1)
+        xnode_lst = np.array(xnode_lst)
+        ynode_lst = np.array(ynode_lst)
+        # resort
+        args = xnode_lst.argsort()
+        xnode_lst = xnode_lst[args]
+        ynode_lst = ynode_lst[args]
+        # fit polynomial with 3rd degree
+        c = np.polyfit(xnode_lst, ynode_lst, deg=3)
+        coeff_lst.append(c)
+
+        if goodmask[iorder]:
+            color = 'r'
+            ls = '-'
+            label = 'Good Order'
+        else:
+            color = 'orange'
+            ls = '--'
+            label = 'Ghost'
+        # plot node
+        # ax.plot(xnode_lst, ynode_lst, ls=ls, c=color, lw=0.5)
+        # plot positions
+        ax.plot(allx, np.polyval(c, allx), ls=ls, c=color, lw=0.5)
+        if label == 'Good Order' and not label_good_added:
+            ax.plot(allx, np.polyval(c, allx), label=label, ls=ls, c=color, lw=0.5)
+            label_good_added = True
+        elif label == 'Ghost' and not label_ghost_added:
+            ax.plot(allx, np.polyval(c, allx), label=label, ls=ls, c=color, lw=0.5)
+            label_ghost_added = True
+
+        # fig0 = plt.figure()
+        # ax01 = fig0.add_subplot(211)
+        # ax02 = fig0.add_subplot(212)
+        # ax01.plot(xnode_lst, ynode_lst, 'o', ms=3)
+        # ax01.plot(allx, np.polyval(c, allx), '-')
+        # ax02.plot(xnode_lst, ynode_lst - np.polyval(c, xnode_lst), 'o', ms=3)
+        # fig0.savefig('order_{}.png'.format(iorder))
+        # plt.close(fig0)
+    cbar_ax = fig.add_axes([0.15, 0.1, 0.7, 0.02])  # [left, bottom, width, height]
+    im = ax.imshow(np.log10(data))
+    cbar = fig.colorbar(im, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Intensity (log scale)')
+
+    ax.set_xlim(0, nx - 1)
+    ax.set_ylim(0, ny - 1)
+    ax.set_xlabel('X(pixel)')
+    ax.set_ylabel('Y(pixel)')
+    ax.legend(loc='lower left', fontsize=6)
+    ax.set_title('Order Detection')
+    fig.savefig('./reduction/bfosc_echelle/figures/Order detection.png')
+
+    return coeff_lst, goodmask
 
 
 class _BFOSC(object):
@@ -270,7 +615,9 @@ class _BFOSC(object):
             self.rawdata_path = rawdata_path
 
     def set_mode(self, mode):
-        pass
+        if mode not in ['longslit', 'echelle']:
+            raise ValueError
+        self.mode = mode
 
     def set_path(self, **kwargs):
         pass
@@ -291,6 +638,7 @@ class _BFOSC(object):
         self.bias_file = os.path.join(self.reduction_path, 'bias.fits')
         self.flat_file = os.path.join(self.reduction_path, 'flat.fits')
         self.sens_file = os.path.join(self.reduction_path, 'sens.fits')
+
     def find_calib_groups(self):
 
         lamp_lst = {}
@@ -309,21 +657,27 @@ class _BFOSC(object):
                 groups.append(logitem_lst)
         self.calib_groups = groups
 
-    def make_obslog(self):
+    def make_obslog(self, filename=None):
+        """Scan Generate
+        """
         obstable = make_obslog(self.rawdata_path, display=True)
 
         # find obsdate
         self.obsdate = obstable[0]['dateobs'][0:10]
 
-        tablename = 'log-{}.txt'.format(self.obsdate)
+        if filename is None:
+            filename = 'bfosc.{}.txt'.format(self.obsdate)
+        filename = os.path.join(self.reduction_path, filename)
 
-        filename = os.path.join(self.reduction_path, tablename)
         obstable.write(filename, format='ascii.fixed_width_two_line',
                        overwrite=True)
         ###
         self.logtable = obstable
 
         self.find_calib_groups()
+
+    def read_obslog(self, filename):
+        self.logtable = Table.read(filename, format='ascii.fixed_width_two_line')
 
     def fileid_to_filename(self, fileid):
         for fname in os.listdir(self.rawdata_path):
@@ -363,24 +717,6 @@ class _BFOSC(object):
                              title=title,
                              )
 
-    def plot_flat(self, show=True):
-        figfilename = os.path.join(self.figpath, 'flat.png')
-        title = 'Flat ({})'.format(os.path.basename(self.flat_file))
-        plot_image_with_hist(self.flat_data,
-                             show=show,
-                             figfilename=figfilename,
-                             title=title,
-                             )
-
-    def plot_sens(self, show=True):
-        figfilename = os.path.join(self.figpath, 'sens.png')
-        title = 'Sensitivity ({})'.format(os.path.basename(self.sens_file))
-        plot_image_with_hist(self.sens_data,
-                             show=show,
-                             figfilename=figfilename,
-                             title=title,
-                             )
-
     def combine_flat(self):
         if os.path.exists(self.flat_file):
             self.flat_data = fits.getdata(self.flat_file)
@@ -401,6 +737,15 @@ class _BFOSC(object):
                                        upper_clip=5, maxiter=10, maskmode='max')
             fits.writeto(self.flat_file, flat_data, overwrite=True)
             self.flat_data = flat_data
+
+    def plot_flat(self, show=True):
+        figfilename = os.path.join(self.figpath, 'flat.png')
+        title = 'Flat ({})'.format(os.path.basename(self.flat_file))
+        plot_image_with_hist(self.flat_data,
+                             show=show,
+                             figfilename=figfilename,
+                             title=title,
+                             )
 
     def get_sens(self):
         ny, nx = self.flat_data.shape
@@ -424,6 +769,102 @@ class _BFOSC(object):
 
         self.sens_data = flat_sens
 
+    def plot_sens(self, show=True):
+        figfilename = os.path.join(self.figpath, 'sens.png')
+        title = 'Sensitivity ({})'.format(os.path.basename(self.sens_file))
+        plot_image_with_hist(self.sens_data,
+                             show=show,
+                             figfilename=figfilename,
+                             title=title,
+                             )
+
+    def trace(self):
+        if self.mode != 'echelle':
+            raise ValueError
+
+        # crop
+        data = self.flat_data[800:, :]
+
+        coeff_lst, goodmask = find_echelle_apertures(data,
+                                                     scan_step=50, align_deg=3)
+        self.coeff_lst = coeff_lst
+        self.goodmask = goodmask
+
+    def get_echelle_sens(self):
+        data = self.flat_data[800:, :]
+        ny, nx = data.shape
+        allx = np.arange(nx)
+        yy, xx = np.mgrid[:ny:, :nx:]
+        sensmap = np.ones_like(data, dtype=np.float32)
+
+        fig = plt.figure()
+        ax = fig.gca()
+        ax.imshow(np.log10(data))
+        fig2 = plt.figure()
+        ax2 = fig2.gca()
+
+        allmask = np.zeros_like(data, dtype=bool)
+
+        # def median_filter(data, kernel_size):
+        #     if kernel_size % 2 == 0:
+        #         raise ValueError("Kernel size must be an odd number.")
+        #     filtered_data = medfilt(data, kernel_size=kernel_size)
+        #
+        #     return filtered_data
+
+        # def bilateral_filter(image, d, sigmaColor, sigmaSpace):
+        #     filtered_image = cv2.bilateralFilter(image, d, sigmaColor, sigmaSpace)
+        #
+        #     return filtered_image
+        for iorder, coeff in enumerate(self.coeff_lst):
+            win = 5
+
+            cen_lst = np.polyval(coeff, allx)
+            ax.plot(allx, cen_lst, c='r', ls='-', lw=0.5)
+
+            mask = (yy < cen_lst + win) * (yy > cen_lst - win)
+            allmask += (yy < cen_lst + win + 5) * (yy > cen_lst - win - 5)
+
+            # skip ghost orders
+            if not self.goodmask[iorder]:
+                continue
+
+            spec = (data * mask).sum(axis=0) / 10
+            ax2.plot(spec, lw=0.5)
+
+            fig0 = plt.figure(dpi=200)
+            ax0 = fig0.gca()
+            ax0.plot(spec, lw=0.5)
+            # spec_sm = median_filter(spec, kernel_size=151)
+            # spec_sm = spec.astype(np.float32)
+            # spec_sm = bilateral_filter(spec_sm, d=9, sigmaColor=75, sigmaSpace=75)
+            # spec_sm = spec_sm.astype(np.float64)
+            spec_sm, _, m, std = iterative_savgol_filter(spec,
+                                                         winlen=201, order=4,
+                                                         upper_clip=10, lower_clip=10,
+                                                         maxiter=5)
+            ax0.plot(spec_sm, lw=0.5)
+            figname = os.path.join(self.figpath, 'smooth_{:02d}.png'.format(iorder))
+            fig0.savefig(figname)
+            plt.close(fig0)
+
+            smooth_2d = np.tile(spec_sm, ny).reshape(ny, nx)
+            sensmap[mask] = (data / smooth_2d)[mask]
+
+        fig3 = plt.figure()
+        ax3 = fig3.gca()
+        ax3.imshow(np.log10(data * (~allmask)))
+
+        fig4 = plt.figure()
+        ax4 = fig4.gca()
+        ax4.imshow(sensmap)
+        filename = os.path.join(self.reduction_path, 'sens.fits')
+        fits.writeto(filename, sensmap, overwrite=True)
+
+        # plt.show()
+
+        self.sens_data = sensmap
+
     def extract_lamp(self):
         lamp_item_lst = filter(lambda item: item['datatype'] == 'SPECLLAMP',
                                self.logtable)
@@ -446,6 +887,61 @@ class _BFOSC(object):
             spec_lst[fileid] = {'wavelength': None, 'flux': spec}
 
         self.lamp_spec_lst = spec_lst
+
+    def extract_echelle_lamp(self):
+        lamp_item_lst = filter(lambda item: item['datatype'] == 'SPECSLAMP',
+                               self.logtable)
+
+        nx = self.flat_data.shape[1]
+        # define dtype of 1-d spectra
+        types = [
+            ('aperture', np.int16),
+            ('order', np.int16),
+            ('points', np.int16),
+            ('wavelength', (np.float64, nx)),
+            ('flux', (np.float32, nx)),
+            ('mask', (np.int32, nx)),
+        ]
+        names, formats = list(zip(*types))
+        wlcalib_spectype = np.dtype({'names': names, 'formats': formats})
+
+        for logitem in lamp_item_lst:
+            fileid = logitem['fileid']
+            filename = self.fileid_to_filename(fileid)
+            data, header = fits.getdata(filename, header=True)
+            data = data - self.bias_data
+            data = data[800:, :]
+            data = data / self.sens_data
+            ny, nx = data.shape
+            allx = np.arange(nx)
+            yy, xx = np.mgrid[:ny:, :nx:]
+
+            spec_lst = []
+            aper = 0
+            for iorder, coeff in enumerate(self.coeff_lst):
+                win = 5
+                if not self.goodmask[iorder]:
+                    continue
+                cen_lst = np.polyval(coeff, allx)
+                mask = (yy < cen_lst + win) * (yy > cen_lst - win)
+                spec = (data * mask).sum(axis=0)
+
+                # pack to table
+                row = (aper, 0, spec.size,
+                       np.zeros(nx, dtype=np.float64),  # wavelength
+                       spec,  # flux
+                       np.zeros(nx, dtype=np.int16),  # mask
+                       )
+                spec_lst.append(row)
+                aper += 1
+            spec_lst = np.array(spec_lst, dtype=wlcalib_spectype)
+
+            hdulst = fits.HDUList([fits.PrimaryHDU(header=header),
+                                   fits.BinTableHDU(data=spec_lst),
+                                   ])
+            filename = os.path.join(self.reduction_path,
+                                    'wlcalib_{}.fits'.format(fileid))
+            hdulst.writeto(filename, overwrite=True)
 
     def identify_wavelength(self):
         pixel_lst = np.arange(self.ndisp)
@@ -1147,8 +1643,8 @@ class _BFOSC(object):
         b1 = background_opt[::-1]
         b2 = background_sum[::-1]
         t_data = Table([w, f1, b1, f2, b2], names=(
-        'wave_lst', 'spec_opt_dbkg', 'background_opt', 'spec_sum_dbkg',
-        'background_sum'))
+            'wave_lst', 'spec_opt_dbkg', 'background_opt', 'spec_sum_dbkg',
+            'background_sum'))
         t_data.write(filename, format='fits', overwrite=True)
 
         # plot 1d spec and backgrounds
@@ -1205,19 +1701,13 @@ class _BFOSC(object):
         logitem_lst = list(filter(func, self.logtable))
         for logitem in logitem_lst:
             self.extract(logitem)
-    # def fluxcalib(self):
-    #     coords = SkyCoord('15:51:59.0', '32:56:53.99', unit=(u.hourangle, u.deg))
-    #     ra = coords.ra.degree
-    #     dec = coords.dec.degree
-    #     fluxstd_data = select_fluxstd_from_database(ra, dec)
-    #     return fluxstd_data
-    # def plot_wlcalib(self):
-    #     fig = plt.figure(figsize=(12, 6), dpi=150)
-    #     ax1 = fig.add_subplot(211)
-    #     ax2 = fig.add_subplot(212)
-    #     ax1.plot(self.wavelength, self.calibflux, lw=0.5)
-    #     ax1.set_xlabel(u'Wavelength (\xc5)')
-    #     plt.show()
+
+    def fluxcalib(self):
+        ra = Angle('15h51m59.0s')
+        dec = Angle('+32d56m53.99s')
+        fluxstd_data = select_fluxstd_from_database(ra, dec)
+        print(fluxstd_data.shape)
+
 def find_order_location(data, figfilename, title):
     def errfunc(p, x, y, fitfunc):
         return y - fitfunc(p, x)
@@ -1414,5 +1904,6 @@ def find_order_location(data, figfilename, title):
     plt.close(fig1)
 
     return coeff_loc, fwhm_mean, interf
+
 
 BFOSC = _BFOSC()

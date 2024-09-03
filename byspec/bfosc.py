@@ -2,7 +2,9 @@ import os
 import re
 import datetime
 import dateutil.parser
-
+import math
+import dateutil.parser
+import ephem as ep
 import numpy as np
 import scipy.interpolate as intp
 import scipy.optimize as opt
@@ -223,10 +225,10 @@ def select_fluxstd_from_database(ra, dec):
         separation = target_coord.separation(source_coord)
         if separation < 12 * u.arcsec:
             print(
-                f"Match found in okestan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
+                f"Match found in okestan.dat - Name: {row['filename']}, MD5: {row['md5_mfile']}")
             fileid = row['filename']
-            md5 = row['md5_ffile']
-            filepath = os.path.join('fluxstd/okestan/', f'f{fileid}.dat')
+            md5 = row['md5_mfile']
+            filepath = os.path.join('fluxstd/okestan/', f'm{fileid}.dat')
             filename = get_file(filepath, md5)
             found_in_okestan = True
             break
@@ -244,10 +246,10 @@ def select_fluxstd_from_database(ra, dec):
             separation = target_coord.separation(source_coord)
             if separation < 12 * u.arcsec:
                 print(
-                    f"Match found in ctiostan.dat - Name: {row['filename']}, MD5: {row['md5_ffile']}")
+                    f"Match found in ctiostan.dat - Name: {row['filename']}, MD5: {row['md5_mfile']}")
                 fileid = row['filename']
-                md5 = row['md5_ffile']
-                filepath = os.path.join('fluxstd/ctiostan/', f'f{fileid}.dat')
+                md5 = row['md5_mfile']
+                filepath = os.path.join('fluxstd/ctiostan/', f'm{fileid}.dat')
                 filename = get_file(filepath, md5)
                 break
         else:
@@ -260,7 +262,7 @@ def select_fluxstd_from_database(ra, dec):
                 columns = line.strip().split()
                 if len(columns) >= 2:
                     fluxstd_data.append(
-                        [np.float64(columns[0]), np.float64(columns[1])])
+                        [np.float64(columns[0]), np.float64(columns[1]), np.float64(columns[2])])
         fluxstd_data = np.array(fluxstd_data)
         return fluxstd_data
     return {}
@@ -1706,73 +1708,189 @@ class _BFOSC(object):
             self.extract(logitem)
 
     def fluxcalib(self):
+
+        def get_airmass(z):
+            """z in degree.
+            """
+            h = 90. - z
+            return 1 / (math.sin((h + 244 / (165 + 47 * h ** 1.1)) / 180 * math.pi))
+
+        def load_obs_spectra(fileid):
+            wave_lst, flux_lst = [], []
+            filename = 'spec_{}.fits'.format(fileid)
+            spec1d_path = os.path.join(self.reduction_path, 'onedspec')
+            self.spec1d_path = spec1d_path
+            filename = os.path.join(self.spec1d_path, filename)
+            data = fits.getdata(filename)
+            for row in data:
+                wave_lst.append(row['wave_lst'])
+                flux_lst.append(row['spec_opt_dbkg'])
+            wave_lst = np.array(wave_lst)
+            flux_lst = np.array(flux_lst)
+            return wave_lst, flux_lst
+
+        def load_fluxstand_spectra(fluxstd_data):
+            # load flux of flux standard star
+            abswave_lst = fluxstd_data[:, 0]
+            mag_lst = fluxstd_data[:, 1]
+            dwave_lst = fluxstd_data[:, 2]
+            # convert to erg/s/cm2/A
+            absflux_lst = 10 ** (-0.4 * (mag_lst + 48.60)) * c / (
+                    abswave_lst * 1e-10) ** 2 * 1e-10
+            # m(AB) = -2.5 log(f_nu) - 48.60
+            # f_nu is measured in erg sec^-1 cm^-2 Hz^-1,
+            # lambda*f_lambda = nu*f_nu
+            # so
+            # f_nu = f_lambda*(lambda/nu) = f_lambda*lambda^2/c.
+            return abswave_lst, absflux_lst, dwave_lst
+
+        def resample_obs_spectra(wave_lst, flux_lst, refwave_lst, dwave_lst):
+            # resampel the observed spectra
+            w_lst, f_lst, m_lst = [], [], []
+            for w, dwave in zip(refwave_lst, dwave_lst):
+                w1 = w - dwave / 2
+                w2 = w + dwave / 2
+                if w1 < wave_lst[0]:
+                    m_lst.append(False)
+                    continue
+                if w2 > wave_lst[-1]:
+                    m_lst.append(False)
+                    continue
+                m = (wave_lst > w1) * (wave_lst < w2)
+                f = flux_lst[m].mean()
+                w_lst.append(w)
+                f_lst.append(f)
+                m_lst.append(True)
+            w_lst = np.array(w_lst)
+            f_lst = np.array(f_lst)
+            m_lst = np.array(m_lst)
+            return w_lst, f_lst, m_lst
+
+        xinglong = ep.Observer()
+        xinglong.long = '117:34:28.35'
+        xinglong.lat = '40:23:45.36'
+        xinglong.elevation = 960.0
+
+        ext_wave_lst, ext_k_lst = [], []
+        file1 = open('bao_extinction.dat')
+        for row in file1:
+            row = row.strip()
+            if len(row) == 0 or row[0] == '#':
+                continue
+            g = row.split()
+            ext_wave_lst.append(float(g[0]))
+            ext_k_lst.append(float(g[1]))
+        file1.close()
+        ext_wave_lst = np.array(ext_wave_lst)
+        ext_k_lst = np.array(ext_k_lst)
+
+        c = 299792458.
+
         func = lambda item: item['datatype'] == 'SPECLTARGET'
         logitem_lst = list(filter(func, self.logtable))
-        ra = logitem_lst[1]['RAJ2000']
-        dec = logitem_lst[1]['DEJ2000']
-        fileid = logitem_lst[1]['fileid']
-        filename = self.fileid_to_filename(fileid)
-        data, header = fits.getdata(filename, header=True)
-        X = header['AIRMASS']
-        t = header['EXPTIME']
-        fluxstd_data = select_fluxstd_from_database(ra, dec)
-        # ergs / cm / cm / s / A * 10 ** 16
-        # print(fluxstd_data[:, 0])
 
-        # Flux Standard
-        filename = 'spec_{}.fits'.format(logitem_lst[1]['fileid'])
-        spec1d_path = os.path.join(self.reduction_path, 'onedspec')
-        self.spec1d_path = spec1d_path
-        filename = os.path.join(self.spec1d_path, filename)
-        data = fits.getdata(filename)
+        # observed flux standard
+        logitem = logitem_lst[1]
+        # exposure start time in local time
+        start_dt = dateutil.parser.parse(logitem['dateobs'])
+        # exposure middle timein local time
+        local_t = start_dt + datetime.timedelta(seconds=logitem['exptime'] / 2)
+        # convert to UT
+        ut = local_t - datetime.timedelta(hours=8)
+        # convert to ephem Date
+        xinglong.date = ep.Date(ut.isoformat().replace('T', ' '))
+        star = ep.readdb('{},f|M|G,{},{},2000'.format(
+            logitem['object'], logitem['RAJ2000'], logitem['DEJ2000']))
+        star.compute(xinglong)
+        # altitude in degree
+        alt = float(star.alt) / math.pi * 180
+        # compute airmass
+        am = get_airmass(alt)
+        print(xinglong.date, logitem['object'], alt, am)
+        fluxstd_data = select_fluxstd_from_database(logitem['RAJ2000'], logitem['DEJ2000'])
+        abswave_lst, absflux_lst, dwave_lst = load_fluxstand_spectra(fluxstd_data)
+        wave_lst, flux_lst = load_obs_spectra(logitem['fileid'])
+        wave0_lst, flux0_lst, mask = resample_obs_spectra(
+            wave_lst, flux_lst, abswave_lst, dwave_lst)
 
-        wave_lst = []
-        div_lst = []
-        for row in data:
-            # row['spec_opt_dbkg'] = max(row['spec_opt_dbkg'], 1e-10)
-            row['spec_opt_dbkg'] = np.abs(row['spec_opt_dbkg'])
-            rounded_wave = round(row['wave_lst'])
-            index = np.where(fluxstd_data[:, 0] == rounded_wave)[0]
-            if index.size > 0:
-                # e = fluxstd_data[:, 0] * 0.15
-                abs_flux = fluxstd_data[index, 1] * 10 ** (-(X * 0.15) / 2.5) * t
-                div = abs_flux / row['spec_opt_dbkg']
-                wave_lst.append(row['wave_lst'])
-                div_lst.append(div)
-        wave_lst = np.array(wave_lst)
-        div_lst = np.array(div_lst)
-        # coefficients = np.polyfit(wave_lst, div_lst, 4)
-        log_div_lst = np.log10(div_lst)
-        coefficients = np.polyfit(wave_lst, log_div_lst, 4)
-        fitted_log_div = np.polyval(coefficients, wave_lst)
+        abswave_lst = abswave_lst[mask]
+        absflux_lst = absflux_lst[mask]
 
-        plt.plot(wave_lst, log_div_lst, label='Original Data')
-        plt.plot(wave_lst, fitted_log_div, color='red', label='Fitted Curve')
-        plt.xlabel('Wavelength')
-        plt.ylabel('Log10 of Spectral Flux Density')
-        plt.legend()
+        fig = plt.figure(dpi=300)
+        ax1 = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212)
+        ax1.plot(wave_lst, flux_lst, lw=0.6, color='C0')
+        ax1.plot(wave0_lst, flux0_lst, lw=0.6, color='C3')
+        ax1c = ax1.twinx()
+        ax1c.plot(abswave_lst, absflux_lst, lw=0.6, color='C1', alpha=1)
+
+        fext = intp.InterpolatedUnivariateSpline(ext_wave_lst, ext_k_lst, k=3)
+
+        r_lst = absflux_lst * 10 ** (-0.4 * am * fext(wave0_lst)) * logitem[
+            'exptime'] / flux0_lst
+        logr_lst = np.log10(np.abs(r_lst))
+
+        coeff = np.polyfit(wave0_lst, logr_lst, deg=12)
+        wnew = np.linspace(wave0_lst[0], wave0_lst[-1], 500)
+        logrmod = np.polyval(coeff, wnew)
+
+        ax2.scatter(abswave_lst, logr_lst, s=15, c='C1')
+        ax2.plot(wnew, logrmod, lw=0.6, color='C3', alpha=1)
+
+        figfilename = os.path.join(self.figpath, 'fluxstandard.png')
+        fig.savefig(figfilename)
+        plt.close(fig)
+
+        f_response = lambda w: 10 ** (np.polyval(coeff, w))
+        # intp.InterpolatedUnivariateSpline(abswave_lst, r_lst, k=3)
+
+        # observed object
+        logitem = logitem_lst[0]
+        # exposure start time in local time
+        start_dt = dateutil.parser.parse(logitem['dateobs'])
+        # exposure middle timein local time
+        local_t = start_dt + datetime.timedelta(seconds=logitem['exptime'] / 2)
+        # convert to UT
+        ut = local_t - datetime.timedelta(hours=8)
+        # convert to ephem Date
+        xinglong.date = ep.Date(ut.isoformat().replace('T', ' '))
+        star = ep.readdb('{},f|M|G,{},{},2000'.format(
+            logitem['object'], logitem['RAJ2000'], logitem['DEJ2000']))
+        star.compute(xinglong)
+        # altitude in degree
+        alt = float(star.alt) / math.pi * 180
+        # compute airmass
+        am = get_airmass(alt)
+        print(xinglong.date, logitem['object'], alt, am)
+
+        wave_lst, flux_lst = load_obs_spectra(logitem['fileid'])
+        absflux_lst = flux_lst / logitem['exptime'] / (
+                10 ** (-0.4 * am * fext(wave_lst))) * f_response(wave_lst)
+
+        fig = plt.figure(dpi=300)
+        ax1 = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212)
+        ax1.plot(wave_lst, flux_lst, lw=0.5)
+        ax2.plot(wave_lst, absflux_lst, lw=0.5)
+        ax2.set_ylim(0, 5e-15)
+        for ax in fig.get_axes():
+            ax.set_xlim(wave_lst[0], wave_lst[-1])
+            ax.grid(True, ls='--')
+            ax.set_axisbelow(True)
+        ax1.set_ylabel('Flux')
+        ax2.set_ylabel(u'F(\u03bb) [erg/s/cm\xb2/\xc5]')
+        ax2.set_xlabel(u'\u03bb [\xc5]')
+        title = '{} ({})'.format(logitem['fileid'], logitem['object'])
+        fig.suptitle(title)
+        figfilename = os.path.join(self.figpath, 'absflux_{}.png'.format(logitem['fileid']))
+        fig.savefig(figfilename)
+        plt.close(fig)
+
+        outfile = open('./reduction/bfosc/absflux_{}.dat'.format(logitem['fileid']), 'w')
+        for w, f in zip(wave_lst, absflux_lst):
+            outfile.write('{:9.4f} {:+12.7e}'.format(w, f) + os.linesep)
+        outfile.close()
         plt.show()
-
-        # Object
-        filename = 'spec_{}.fits'.format(logitem_lst[0]['fileid'])
-        filename = os.path.join(self.spec1d_path, filename)
-        data = fits.getdata(filename)
-
-        obj_spec = []
-        obj_w = []
-        for row in data:
-            row['spec_opt_dbkg'] = max(row['spec_opt_dbkg'], 1e-10)
-            obj_spec.append(row['spec_opt_dbkg'])
-            obj_w.append(row['wave_lst'])
-        obj_spec = np.array(obj_spec)
-        obj_w = np.array(obj_w)
-        fitted_div = np.polyval(coefficients, obj_w)
-        abs_spec = obj_spec * fitted_div
-        plt.plot(obj_w, abs_spec)
-        plt.xlabel('Wavelength')
-        plt.ylabel('abs_spec')
-        plt.show()
-
 
 def find_order_location(data, figfilename, title):
     def errfunc(p, x, y, fitfunc):

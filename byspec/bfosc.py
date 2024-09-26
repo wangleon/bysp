@@ -6,6 +6,7 @@ import dateutil.parser
 import numpy as np
 import scipy.interpolate as intp
 import scipy.optimize as opt
+import scipy.signal as sg
 from astropy.table import Table, Row
 import astropy.io.fits as fits
 import matplotlib.pyplot as plt
@@ -15,8 +16,10 @@ from .utils import get_file
 from .imageproc import combine_images
 from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         gaussian, gengaussian,
-                        consecutive, find_shift_ccf, get_clip_mean)
+                        consecutive, find_shift_ccf, get_clip_mean,
+                        get_local_minima)
 from .visual import plot_image_with_hist
+from .common import FOSCReducer
 
 def print_wrapper(string, item):
     """A wrapper for obslog printing
@@ -125,7 +128,8 @@ def make_obslog(path, display=True):
         else:
             slit = ''
 
-        if datatype in ['BIAS', 'SPECLFLAT', 'SPECLLAMP']:
+        if datatype in ['BIAS', 'SPECLFLAT', 'SPECLLAMP',
+                                'SPECSFLAT', 'SPECSLAMP',]:
             ra, dec = '', ''
 
         obstable.add_row((frameid, fileid, datatype, objname, exptime, dateobs,
@@ -490,59 +494,33 @@ def find_echelle_apertures(data, align_deg, scan_step):
     return coeff_lst, goodmask
 
 
-class _BFOSC(object):
-    def __init__(self, rawdata_path=None, mode=None):
-        self.mode = mode
-
-        if rawdata_path is not None and os.path.exists(rawdata_path):
-            self.rawdata_path = rawdata_path
+class BFOSC(FOSCReducer):
+    def __init__(self, **kwargs):
+        super(BFOSC, self).__init__(**kwargs)
 
     def set_mode(self, mode):
         if mode not in ['longslit', 'echelle']:
             raise ValueError
         self.mode = mode
 
-    def set_path(self, **kwargs):
-        pass
-
-    def set_rawdata_path(self, rawdata_path):
-        if os.path.exists(rawdata_path):
-            self.rawdata_path = rawdata_path
-
-    def set_reduction_path(self, reduction_path):
-        if not os.path.exists(reduction_path):
-            os.mkdir(reduction_path)
-        self.reduction_path = reduction_path
-
-        self.figpath = os.path.join(self.reduction_path, 'figures')
-        if not os.path.exists(self.figpath):
-            os.mkdir(self.figpath)
-
-        self.bias_file = os.path.join(self.reduction_path, 'bias.fits')
-        self.flat_file = os.path.join(self.reduction_path, 'flat.fits')
-        self.sens_file = os.path.join(self.reduction_path, 'sens.fits')
 
     def make_obslog(self, filename=None):
-        """Scan Generate 
+        """Scan the raw data path and generate an observing log.
         """
-        obstable = make_obslog(self.rawdata_path, display=True)
+        logtable = make_obslog(self.rawdata_path, display=True)
 
         # find obsdate
-        self.obsdate = obstable[0]['dateobs'][0:10]
+        self.obsdate = logtable[0]['dateobs'][0:10]
 
         if filename is None:
             filename = 'bfosc.{}.txt'.format(self.obsdate)
         filename = os.path.join(self.reduction_path, filename)
 
-        obstable.write(filename, format='ascii.fixed_width_two_line',
+        logtable.write(filename, format='ascii.fixed_width_two_line',
                         overwrite=True)
-        ###
-        self.logtable = obstable
+        self.logtable = logtable
 
         self.find_calib_groups()
-
-    def read_obslog(self, filename):
-        self.logtable = Table.read(filename, format='ascii.fixed_width_two_line')
 
     def fileid_to_filename(self, fileid):
         for fname in os.listdir(self.rawdata_path):
@@ -600,34 +578,9 @@ class _BFOSC(object):
                         title       = title,
                         )
 
-    def combine_flat(self):
-        if os.path.exists(self.flat_file):
-            self.flat_data = fits.getdata(self.flat_file)
-        else:
-            print('Combine Flat')
-            data_lst = []
-
-            if self.mode == 'longslit':
-                flatkey = 'SPECLFLAT'
-            elif self.mode == 'echelle':
-                flatkey = 'SPECSFLAT'
-            else:
-                raise ValueError
-
-            flat_item_lst = filter(lambda item: item['datatype']==flatkey,
-                                       self.logtable)
-
-            for logitem in flat_item_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                # correct bias
-                data = data - self.bias_data
-                data_lst.append(data)
-            data_lst = np.array(data_lst)
-            flat_data = combine_images(data_lst, mode='mean',
-                                    upper_clip=5, maxiter=10, maskmode='max')
-            fits.writeto(self.flat_file, flat_data, overwrite=True)
-            self.flat_data = flat_data
+    def get_conf_string(self, logitem):
+        return '{mode}.{config}.{binning}.{gain:3.1f}.{rdnoise:3.2f}'.format(
+                **logitem)
 
     def trace(self):
         if self.mode != 'echelle':
@@ -645,6 +598,25 @@ class _BFOSC(object):
         data = self.flat_data[800:, :]
         ny, nx = data.shape
         allx = np.arange(nx)
+        ally = np.arange(ny)
+
+        # fix flat data
+        #m = np.ones(ny, dtype=bool)
+        #m[1537-800:1538+1-800] = False
+        #fixdata = data.copy()
+        #fig = plt.figure()
+        #ax = fig.gca()
+        #for x in np.arange(nx):
+        #    flux = np.log(data[:, x])
+        #    fixfunc = intp.InterpolatedUnivariateSpline(ally[m], flux[m], k=2)
+        #    fixdata[:, x][~m] = np.exp(fixfunc(ally[~m]))
+        #    if 320 < x < 330:
+        #        ax.plot(ally, flux, '-')
+        #        ax.plot(ally[m], flux[m], '--')
+        #        ax.plot(ally[~m], fixdata[:,x][~m], 'o')
+        #plt.show()
+        #data = fixdata
+
         yy, xx = np.mgrid[:ny:, :nx:]
         sensmap = np.ones_like(data, dtype=np.float32)
 
@@ -674,10 +646,31 @@ class _BFOSC(object):
             fig0 =plt.figure(dpi=200)
             ax0 = fig0.gca()
             ax0.plot(spec, lw=0.5)
-            spec_sm, _, m, std = iterative_savgol_filter(spec,
-                                winlen=151, order=3,
-                                upper_clip=5, lower_clip=5, maxiter=5)
+            ## smooth
+
+            #spec_sm, _, m, std = iterative_savgol_filter(spec,
+            #                    winlen=21, order=3,
+            #                    upper_clip=5, lower_clip=5, maxiter=5)
+           
+
+            #core = sg.gaussian(15, std=3)
+            #core /= core.sum()
+            #spec_sm = np.convolve(spec, core, mode='same')
+
+            m = np.ones_like(spec, dtype=bool)
+            for i in range(3):
+                coeff = np.polyfit(allx[m], spec[m], deg=7)
+                res_lst = spec - np.polyval(coeff, allx)
+                std = res_lst[m].std()
+                newm = (res_lst > -3*std) * (res_lst < 3*std)
+                if newm.sum()==m.sum():
+                    break
+                m = newm
+            spec_sm = np.polyval(coeff, allx)
+        
             ax0.plot(spec_sm, lw=0.5)
+            minidx, minvalue = get_local_minima(spec_sm, window=31)
+            ax0.plot(minidx, minvalue, 'o', ms=2, alpha=0.6)
             fig0.savefig('smooth_{:02d}.png'.format(iorder))
             plt.close(fig0)
 
@@ -685,6 +678,12 @@ class _BFOSC(object):
             sensmap[mask] = (data/smooth_2d)[mask]
 
     
+
+        hdulst = fits.HDUList([fits.PrimaryHDU(data=data),
+                               fits.ImageHDU(data=np.int16(~allmask)),
+                               ])
+        hdulst.writeto('flat_background.fits', overwrite=True)
+
         fig3 = plt.figure()
         ax3 = fig3.gca()
         ax3.imshow(np.log10(data*(~allmask)))
@@ -1644,5 +1643,3 @@ def group_caliblamps(lamp_item_lst):
         logitem_groups.append(logitem_lst)
     return logitem_groups
 
-
-BFOSC = _BFOSC()

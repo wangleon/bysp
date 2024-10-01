@@ -162,3 +162,64 @@ def get_clip_mean(x, err=None, mask=None, high=3, low=3, maxiter=5):
 
     return mean, std, new_mask
 
+def get_local_minima(x, window=None):
+    """Get the local minima of a 1d array in a window.
+
+    Args:
+        x (:class:`numpy.ndarray`): A list or Numpy 1d array.
+        window (*int* or :class:`numpy.ndarray`): An odd integer or a list of
+            odd integers as the lengthes of searching window.
+    Returns:
+        tuple: A tuple containing:
+
+            * **index** (:class:`numpy.ndarray`): A numpy 1d array containing 
+              indices of all local minima.
+            * **x[index]** (:class:`numpy.ndarray`): A numpy 1d array containing
+              values of all local minima.
+
+    """
+    x = np.array(x)
+    dif = np.diff(x)
+    ind = dif > 0
+    tmp = np.logical_xor(ind, np.roll(ind,1))
+    idx = np.logical_and(tmp,ind)
+    index = np.where(idx)[0]
+    if window is None:
+        # window is not given
+        return index, x[index]
+    else:
+        # window is given
+        if isinstance(window, int):
+            # window is an integer
+            window = np.repeat(window, len(x))
+        elif isinstance(window, np.ndarray):
+            # window is a numpy array
+            #if np.issubdtype(window.dtype, int):
+            if window.dtype.type in [np.int16, np.int32, np.int64]:
+                pass
+            else:
+                # window are not integers
+                print('window array are not integers')
+                raise ValueError
+        else:
+            raise ValueError
+
+        if 0 in window%2:
+            # not all of the windows are odd
+            raise ValueError
+
+        halfwin_lst = (window-1)//2
+        index_lst = []
+        for i in index:
+            halfwin = halfwin_lst[i]
+            i1 = max(0, i-halfwin)
+            i2 = min(i+halfwin+1, len(x))
+            if i == x[i1:i2].argmin() + i1:
+                index_lst.append(i)
+        if len(index_lst)>0:
+            index_lst = np.array(index_lst)
+            return index_lst, x[index_lst]
+        else:
+            return np.array([]), np.array([])
+
+

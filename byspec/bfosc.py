@@ -19,6 +19,7 @@ from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         consecutive, find_shift_ccf, get_clip_mean,
                         get_local_minima)
 from .visual import plot_image_with_hist
+
 from .common import FOSCReducer
 
 def print_wrapper(string, item):
@@ -141,7 +142,7 @@ def make_obslog(path, display=True):
 
             string = fmt_str.format(
                     '[{:d}]'.format(frameid), str(fileid),
-                    '{:3s}'.format(datatype),
+                    '{:12s}'.format(datatype),
                     objname, exptime, dateobs[0:23], mode, config, 
                     slit, filtername, binning, gain, rdnoise,
                     '{:5d}'.format(q99), observer,
@@ -530,26 +531,52 @@ class BFOSC(FOSCReducer):
 
     def get_bias(self):
 
-        if os.path.exists(self.bias_file):
-            self.bias_data = fits.getdata(self.bias_file)
+        self.get_all_ccdconf()
+        self.bias = {}
 
-        else:
-            print('Combine bias')
-            data_lst = []
+        for ccdconf in self.ccdconf_lst:
+            bias_file = 'bias_{}.fits'.format(ccdconf)
+            bias_filename = os.path.join(self.reduction_path, bias_file)
+            if os.path.exists(bias_filename):
+                hdulst = fits.open(bias_filename)
+                bias_data = hdulst[1].data
+                bias_img  = hdulst[2].data
+                hdulst.close()
+            else:
+                print('Combine bias')
+                data_lst = []
+                selectfunc = lambda item: item['datatype']=='BIAS' and \
+                                self.get_ccdconf_string(item)==ccdconf
 
-            bias_item_lst = filter(lambda item: item['datatype']=='BIAS',
-                                   self.logtable)
+                bias_item_lst = filter(selectfunc, self.logtable)
+                
+                for logitem in bias_item_lst:
+                    filename = self.fileid_to_filename(logitem['fileid'])
+                    data = fits.getdata(filename)
+                    data_lst.append(data)
+                data_lst = np.array(data_lst)
+                
+                bias_data = combine_images(data_lst, mode='mean',
+                                upper_clip=5, maxiter=10, maskmode='max')
 
-            for logitem in bias_item_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                data_lst.append(data)
-            data_lst = np.array(data_lst)
+                # get the mean cross-section of coadded bias image
+                section = bias_data.mean(axis=0)
+                # get the smoothed cross-section
+                smsection = sg.savgol_filter(section,
+                            window_length=151, polyorder=3)
+                # broadcast the smoothed section to the entire image
+                ny, nx = bias_data.shape
+                #bias_img = np.repeat(smsection, nx).reshape(-1, nx)
+                bias_img = np.tile(smsection, ny).reshape(ny, -1)
 
-            bias_data = combine_images(data_lst, mode='mean',
-                            upper_clip=5, maxiter=10, maskmode='max')
-            fits.writeto(self.bias_file, bias_data, overwrite=True)
-            self.bias_data = bias_data
+                # save to fits file
+                hdulst = fits.HDUList([fits.PrimaryHDU(),
+                                       fits.ImageHDU(data=bias_data),
+                                       fits.ImageHDU(data=bias_img),
+                                       ])
+                hdulst.writeto(bias_filename, overwrite=True)
+
+            self.bias[ccdconf] = bias_img
 
     def plot_bias(self, show=True):
         figfilename = os.path.join(self.figpath, 'bias.png')

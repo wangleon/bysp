@@ -1,6 +1,7 @@
 import os
 import re
 import datetime
+import dateutil.parser
 
 import numpy as np
 import scipy.signal as sg
@@ -12,8 +13,9 @@ import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tck
 
+from .utils import get_file
 from .imageproc import combine_images
-from .onedarray import (iterative_savgol_filter,
+from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         gaussian, gengaussian,
                         find_shift_ccf)
 from .common import FOSCReducer
@@ -223,8 +225,9 @@ def get_longslit_sensmap(data):
     for x in allx:
         # take columns
         flux1d = data[:, x]
-        flux1d_sm, _, mask, std = iterative_savgol_filter(flux1d,
-                                    winlen=51, order=3,
+        flux1d_sm, _, mask, std = iterative_savgol_filter(
+                                    flux1d,
+                                    winlen=51, order=3, mode='interp',
                                     upper_clip=6, lower_clip=6, maxiter=10)
         sensmap[:, x] = flux1d/flux1d_sm
 
@@ -264,6 +267,41 @@ def find_distortion(data):
     ax3.set_xlim(0, nx-1)
 
     plt.show()
+
+def select_calib_from_database(index_file, lamp,  mode, config, dateobs):
+    calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
+
+    # select the corresponding arclamp, mode, and config
+    mask =  (calibtable['object'] == lamp) * \
+            (calibtable['mode']   == mode) * \
+            (calibtable['config'] == config)
+
+    calibtable = calibtable[mask]
+    
+    input_date = dateutil.parser.parse(dateobs)
+
+
+    # select the closest ThAr
+    timediff = [(dateutil.parser.parse(t)-input_date).total_seconds()
+                for t in calibtable['dateobs']]
+    irow = np.abs(timediff).argmin()
+    row = calibtable[irow]
+    fileid = row['fileid']  # selected fileid
+    md5    = row['md5']
+
+    message = 'Select {} from database index as {} reference'.format(fileid, lamp)
+    print(message)
+
+    filepath = os.path.join('calib/yfosc/', 'wlcalib_{}.fits'.format(fileid))
+    filename = get_file(filepath, md5)
+
+    # load spec, calib, and aperset from selected FITS file
+    hdu_lst = fits.open(filename)
+    head = hdu_lst[0].header
+    spec = hdu_lst[1].data
+    hdu_lst.close()
+
+    return spec
 
 
 class YFOSC(FOSCReducer):
@@ -446,6 +484,348 @@ class YFOSC(FOSCReducer):
 
     def ident_longslit_wavelength(self):
 
+        index_file = os.path.join(os.path.dirname(__file__),
+                              'data/calib/wlcalib_yfosc.dat')
+
+        def errfunc(p, x, y, fitfunc):
+            return y - fitfunc(p, x)
+        def fitline(p, x):
+            nline = int((len(p)-1)/4)
+            y = np.ones_like(x, dtype=np.float64) + p[0]
+            for i in range(nline):
+                A, alpha, beta, center = p[i*4+1:i*4+5]
+                y = y + gengaussian(A, alpha, beta, center, x)
+            return y
+
+        deg = 4
+
+        for logitem in self.logtable:
+            if logitem['mode']!='longslit' or logitem['datatype']!='LAMP':
+                continue
+            if logitem['fileid'] not in self.arclamp:
+                continue
+
+            spec = self.arclamp[logitem['fileid']]
+            n = spec.size
+
+            ref_data = select_calib_from_database(index_file,
+                                lamp = logitem['object'],
+                                mode = logitem['mode'],
+                                config = logitem['config'],
+                                dateobs = logitem['dateobs'],
+                                )
+            ref_wave = ref_data['wavelength']
+            ref_flux = ref_data['flux']
+            ref_pixel = np.arange(ref_wave.size)
+
+            shift_lst = np.arange(-50, 50)
+            ccf_lst = get_simple_ccf(spec, ref_flux, shift_lst)
+            shift = shift_lst[ccf_lst.argmax()]
+
+            #fig = plt.figure()
+            #ax = fig.gca()
+            ##ax.plot(spec)
+            ##ax.plot(ref_spec['flux'])
+            #ax.plot(shift_lst, ccf_lst)
+            #plt.show()
+
+            if ref_wave[0] > ref_wave[-1]:
+                ref_wave = ref_wave[::-1]
+                ref_flux = ref_flux[::-1]
+                ref_pixel = ref_pixel[::-1]
+
+            f_wave_to_pix = intp.InterpolatedUnivariateSpline(
+                    ref_wave, ref_pixel, k=3)
+
+            lamp = logitem['object']
+            filename = os.path.dirname(__file__) + '/data/linelist/{}.dat'.format(lamp)
+            linelist = Table.read(filename, format='ascii.fixed_width_two_line')
+            linelist.add_column([-1]*len(linelist), index=-1, name='pixel')
+            linelist.add_column([-1]*len(linelist), index=-1, name='i1')
+            linelist.add_column([-1]*len(linelist), index=-1, name='i2')
+            linelist.add_column([-1]*len(linelist), index=-1, name='fitid')
+
+            n = spec.size
+            pixel_lst = np.arange(n)
+
+            for iline, line in enumerate(linelist):
+                pix1 = f_wave_to_pix(line['wave_air']) + shift
+                cint1 = int(round(pix1))
+                i1, i2 = cint1 - 8, cint1 + 9
+                i1 = max(i1, 0)
+                i2 = min(i2, n-1)
+                linelist[iline]['pixel'] = cint1
+                linelist[iline]['i1'] = i1
+                linelist[iline]['i2'] = i2
+
+            m = (linelist['pixel']>0)*(linelist['pixel']<n-1)
+            linelist = linelist[m]
+
+            wave_lst, species_lst = [], []
+            # fitting parameter results
+            alpha_lst, beta_lst, center_lst = [], [], []
+            A_lst, bkg_lst, std_lst, fwhm_lst = [], [], [], []
+            # initialize line-by-line figure
+            fig_lbl = plt.figure(figsize=(16, 9), dpi=150, tight_layout=True)
+            nrow, ncol = 6, 7
+
+            count_line = 0  # fitting counter
+            for iline, line in enumerate(linelist):
+                if line['fitid'] >=0:
+                    continue
+
+                i1 = line['i1']
+                i2 = line['i2']
+                # add background level
+                ydata = spec[i1:i2]
+                p0 = [ydata.min()]
+                p0.append(spec[line['pixel']]-ydata.min())
+                p0.append(3.6)
+                p0.append(3.5)
+                p0.append(line['pixel'])
+
+                lower_bounds = [-np.inf, 0,      0.5, 0.1, i1]
+                upper_bounds = [np.inf,  np.inf, 20,   20, i2]
+
+                inextline = iline + 1
+                idx_lst = [iline]
+                while(True):
+                    if inextline >= len(linelist):
+                        break
+                    nextline = linelist[inextline]
+                    next_i1 = nextline['i1']
+                    next_i2 = nextline['i2']
+                    if next_i1 < i2 - 3:
+                        i2 = next_i2
+                        ydata = spec[i1:i2]
+                        # update backgroud
+                        p0[0] = ydata.min()
+                        p0.append(spec[nextline['pixel']] - ydata.min())
+                        p0.append(3.6)
+                        p0.append(3.5)
+                        p0.append(nextline['pixel'])
+                        lower_bounds.append(0)
+                        lower_bounds.append(0.5)
+                        lower_bounds.append(0.1)
+                        lower_bounds.append(next_i1)
+                        upper_bounds.append(np.inf)
+                        upper_bounds.append(20)
+                        upper_bounds.append(20)
+                        upper_bounds.append(next_i2)
+                        idx_lst.append(inextline)
+                    else:
+                        break
+
+                    inextline += 1
+
+                xdata = np.arange(i1, i2)
+
+                fitres = opt.least_squares(errfunc, p0,
+                            bounds=(lower_bounds, upper_bounds),
+                            args=(xdata, ydata, fitline),
+                            )
+
+                param = fitres['x']
+
+                fmt_str = '{:10.4f} {:4d} {:4d} {:6.3f} {:6.3f} {:8.3f} {:3d}'
+
+                nline = int((len(param)-1)/4)
+                for i in range(nline):
+                    A, alpha, beta, center = param[i*4+1:i*4+5]
+                    line = linelist[iline+i]
+                    print(fmt_str.format(line['wave_air'], i1, i2,
+                            alpha, beta, center, count_line))
+                    wave_lst.append(line['wave_air'])
+                    species_lst.append('{} {}'.format(line['element'], line['ion']))
+                    # append fitting results
+                    center_lst.append(center)
+                    A_lst.append(A)
+                    alpha_lst.append(alpha)
+                    beta_lst.append(beta)
+                    fwhm = 2*alpha*np.power(np.log(2), 1/beta)
+                    fwhm_lst.append(fwhm)
+                    bkg_lst.append(param[0])
+                    std = np.sqrt(fitres['cost']*2/xdata.size)
+                    std_lst.append(std)
+
+                    linelist['i1'][idx_lst[i]] = i1
+                    linelist['i2'][idx_lst[i]] = i2
+                    linelist['fitid'][iline+i] = count_line
+
+                count_line += 1
+
+                # plot line-by-line
+                if count_line > nrow*ncol:
+                    continue
+                # create small axes
+                axs = fig_lbl.add_subplot(nrow, ncol, count_line)
+                axs.plot(xdata, ydata*1e-3, 'o', c='C0', ms=3, alpha=0.6)
+                # plot fitted curve
+                newx = np.linspace(xdata[0], xdata[-1], 100)
+                newy = fitline(param, newx)
+                axs.plot(newx, newy*1e-3, ls='-', color='C1', lw=1, alpha=0.7)
+
+                # draw text and plot line center as vertical lines
+                text_lst = []
+                for i in range(nline):
+                    A, alpha, beta, center = param[i*4+1:i*4+5]
+                    line = linelist[iline+i]
+                    axs.axvline(x=center, color='k', ls='--', lw=0.7)
+                    text = '{} {} {:9.4f}'.format(line['element'], line['ion'], line['wave_air'])
+                    text_lst.append(text)
+                _text = '\n'.join(text_lst)
+                axs.set_xlim(newx[0], newx[-1])
+                _x1, _x2 = axs.get_xlim()
+                _y1, _y2 = axs.get_ylim()
+                _y2 = _y2 + 0.2*(_y2 - _y1)
+                axs.text(0.95*_x1+0.05*_x2, 0.05*_y1+0.95*_y2, _text,
+                         ha='left', va='top', fontsize=8)
+                axs.set_ylim(_y1, _y2)
+                axs.xaxis.set_major_locator(tck.MultipleLocator(5))
+                axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
+                for tick in axs.xaxis.get_major_ticks():
+                    tick.label1.set_fontsize(7)
+                for tick in axs.yaxis.get_major_ticks():
+                    tick.label1.set_fontsize(7)
+            
+            figfilename = 'linefit_lbl.png'
+            fig_lbl.savefig(figfilename)
+            plt.close(fig_lbl)
+
+            # fit wavelength solution
+            wave_lst = np.array(wave_lst)
+            center_lst = np.array(center_lst)
+            idx = center_lst.argsort()
+            center_lst = center_lst[idx]
+            wave_lst = wave_lst[idx]
+
+            mask = np.ones_like(wave_lst, dtype=bool)
+            for i in range(3):
+                coeff_wave = np.polyfit(center_lst[mask], wave_lst[mask],
+                                        deg=deg)
+                allwave = np.polyval(coeff_wave, pixel_lst)
+                fitwave = np.polyval(coeff_wave, center_lst)
+                reswave = wave_lst - fitwave
+                stdwave = reswave[mask].std()
+                newmask = np.abs(reswave) < 3*stdwave
+                if newmask.sum()==mask.sum():
+                    break
+                mask = newmask
+
+            # prepare the wavelength calibrated arc lamp spectra
+            newtable = Table([allwave, spec], names=['wavelength', 'flux'])
+
+            # prepare the identified line list
+            linelist = linelist['wave_air', 'element', 'ion', 'source',
+                                'i1', 'i2', 'fitid']
+            linelist = linelist[linelist['fitid']>=0]
+            linelist.add_column(center_lst,     index=-1, name='pixel')
+            linelist.add_column(reswave,        index=-1, name='residual')
+            linelist.add_column(np.int16(mask), index=-1, name='use')
+            linelist.add_column(A_lst,          index=-1, name='A')
+            linelist.add_column(alpha_lst,      index=-1, name='alpha')
+            linelist.add_column(beta_lst,       index=-1, name='beta')
+            linelist.add_column(bkg_lst,        index=-1, name='bkg')
+            linelist.add_column(fwhm_lst,       index=-1, name='fwhm')
+            linelist.add_column(std_lst,        index=-1, name='std')
+
+            # prepare the FITS header
+            head = fits.Header()
+            head['OBSERVAT'] = 'YNAO'
+            head['TELESCOP'] = 'Lijiang 2.4m'
+            head['INSTRUME'] = 'YFOSC'
+            head['FILEID']   = logitem['fileid']
+            head['OBJECT']   = logitem['object']
+            head['EXPTIME']  = logitem['exptime']
+            head['DATEOBS']  = logitem['dateobs']
+            head['MODE']     = logitem['mode']
+            head['CONFIG']   = logitem['config']
+            head['SLIT']     = logitem['slit']
+            head['BINNING']  = logitem['binning']
+            head['GAIN']     = logitem['gain']
+            head['RDSPEED']  = logitem['rdspeed']
+            head['FITFUNC']  = 'GENGAUSSIAN'
+            head['FITDEG']   = deg
+            head['WAVERMS']  = stdwave
+            head['NTOTAL']   = len(mask)
+            head['NUSED']    = mask.sum()
+            hdulst = fits.HDUList([
+                        fits.PrimaryHDU(header=head),
+                        fits.BinTableHDU(data=newtable),
+                        fits.BinTableHDU(data=linelist),
+                ])
+            hdulst.writeto('wlcalib_{}.fits'.format(logitem['fileid']),
+                           overwrite=True)
+
+            # plot wavelength solution
+            fig_sol = plt.figure(figsize=(12, 6), dpi=300)
+            axt1 = fig_sol.add_axes([0.07, 0.40, 0.44, 0.52])
+            axt2 = fig_sol.add_axes([0.07, 0.10, 0.44, 0.26])
+            axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
+            axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
+
+            axt1.plot(pixel_lst, allwave, c='k', lw=0.6, zorder=10)
+            species = np.unique(species_lst)
+            for ispecies, _species in enumerate(sorted(species)):
+                m = np.array([v==_species for v in species_lst])
+                c = 'C{}'.format(ispecies)
+                axt1.plot(center_lst[mask*m], wave_lst[mask*m], 'o',
+                          ms=4, c=c, label=_species, alpha=0.7)
+                axt1.plot(center_lst[(~mask)*m], wave_lst[(~mask)*m], 'o',
+                          ms=5, c='none', mec=c, alpha=0.7)
+                axt2.plot(center_lst[mask*m], reswave[mask*m], 'o',
+                          ms=4, c=c, alpha=0.7)
+                axt2.plot(center_lst[(~mask)*m], reswave[(~mask)*m], 'o',
+                          ms=5, c='none', mec=c, alpha=0.7)
+            axt1.legend(loc='upper center', ncols=len(species))
+
+            axt2.axhline(y=0, color='k', ls='--', lw=0.6, zorder=-1)
+            axt2.axhline(y=stdwave, color='k', ls='--', lw=0.6, zorder=-1)
+            axt2.axhline(y=-stdwave, color='k', ls='--', lw=0.6, zorder=-1)
+            for ax in fig_sol.get_axes():
+                ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
+                ax.set_axisbelow(True)
+                ax.set_xlim(0, n-1)
+            y1, y2 = axt2.get_ylim()
+            axt2.text(0.03*n, 0.1*y1 + 0.9*y2,
+                      u'RMS = {:5.3f} \xc5'.format(stdwave),
+                      ha='left', va='top')
+            z = max(abs(y1), abs(y2))
+            axt2.set_ylim(-z, z)
+            axt2.set_xlabel('Pixel')
+            axt1.set_ylabel(u'\u03bb (\xc5)')
+            axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
+            axt1.set_xticklabels([])
+            axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
+            axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+            axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
+            axt5.set_xlabel('Pixel')
+            axt5.set_ylabel(u'dv/dx (km/s)')
+            title = 'Wavelength Solution for {}'.format(logitem['fileid'])
+            fig_sol.suptitle(title)
+            figname = 'wavelength_solution2_{}.png'.format(logitem['fileid'])
+            figfilename = os.path.join(self.reduction_path, figname)
+            fig_sol.savefig(figfilename)
+            plt.close(fig_sol)
+
+            fig = plt.figure()
+            ax1 = fig.add_subplot(211)
+            ax2 = fig.add_subplot(212)
+            ax1.plot(spec, lw=0.5)
+            ax2.plot(allwave, spec, lw=0.5)
+            for c, w in zip(center_lst, wave_lst):
+                ax1.axvline(c, c='k', ls='--', lw=0.5)
+                ax2.axvline(w, c='k', ls='--', lw=0.5)
+
+            _y1, _y2 = ax2.get_ylim()
+            for w in linelist['wave_air']:
+                ax2.axvline(w, ymin=0.9, ymax=1,
+                            c='k', ls='-', lw=0.5, alpha=0.2)
+
+            plt.show()
+
+    def ident_longslit_wavelength2(self):
+
         for logitem in self.logtable:
             if logitem['mode']!='longslit' or logitem['datatype']!='LAMP':
                 continue
@@ -475,7 +855,7 @@ class YFOSC(FOSCReducer):
                 c_lst.append(float(g[0])-500)
                 w_lst.append(float(g[1]))
             file1.close()
-            
+
             wave_lst, center_lst = [], []
             
             fig_lbl = plt.figure(figsize=(15, 8), dpi=150, tight_layout=True)
@@ -566,6 +946,7 @@ class YFOSC(FOSCReducer):
 
             wave_lst, center_lst = [], []
             species_lst = []
+            fwhm_lst = []
             fig_lbl2 = plt.figure(figsize=(16, 9), dpi=150, tight_layout=True)
             nrow, ncol = 6, 7
             count_line = 0
@@ -577,9 +958,9 @@ class YFOSC(FOSCReducer):
                 i1 = line['i1']
                 i2 = line['i2']
                 # add background level
-                p0 = [ydata.min()]
 
                 ydata = spec[i1:i2]
+                p0 = [ydata.min()]
                 p0.append(spec[line['pixel']]-ydata.min())
                 p0.append(3.6)
                 p0.append(3.5)
@@ -589,13 +970,14 @@ class YFOSC(FOSCReducer):
                 upper_bounds = [np.inf,  np.inf, 20,   20, i2]
 
                 inextline = iline + 1
+                idx_lst = [iline]
                 while(True):
                     if inextline >= len(linelist):
                         break
                     nextline = linelist[inextline]
                     next_i1 = nextline['i1']
                     next_i2 = nextline['i2']
-                    if next_i1 < i2-3:
+                    if next_i1 < i2 - 3:
                         i2 = next_i2
                         ydata = spec[i1:i2]
                         # update backgroud
@@ -612,6 +994,10 @@ class YFOSC(FOSCReducer):
                         upper_bounds.append(20)
                         upper_bounds.append(20)
                         upper_bounds.append(next_i2)
+                        idx_lst.append(inextline)
+                    else:
+                        break
+
                     inextline += 1
 
                 xdata = np.arange(i1, i2)
@@ -628,12 +1014,16 @@ class YFOSC(FOSCReducer):
                 nline = int((len(param)-1)/4)
                 for i in range(nline):
                     A, alpha, beta, center = param[i*4+1:i*4+5]
+                    fwhm = 2*alpha*np.power(np.log(2), 1/beta)
                     line = linelist[iline+i]
                     print(fmt_str.format(line['wave_air'], i1, i2,
                             alpha, beta, center, count_line))
                     center_lst.append(center)
                     wave_lst.append(line['wave_air'])
+                    fwhm_lst.append(fwhm)
                     species_lst.append('{} {}'.format(line['element'], line['ion']))
+                    linelist['i1'][idx_lst[i]] = i1
+                    linelist['i2'][idx_lst[i]] = i2
                     linelist['fitid'][iline+i] = count_line
 
                 count_line += 1
@@ -692,6 +1082,40 @@ class YFOSC(FOSCReducer):
                 if newmask.sum()==mask.sum():
                     break
                 mask = newmask
+
+            linelist = linelist['wave_air', 'element', 'ion', 'source',
+                                'i1', 'i2', 'fitid']
+            linelist.add_column(center_lst,     index=-1, name='pixel')
+            linelist.add_column(np.int16(mask), index=-1, name='mask')
+            linelist.add_column(fwhm_lst,       index=-1, name='fwhm')
+
+            newtable = Table([allwave, spec], names=['wavelength', 'flux'])
+
+            head = fits.Header()
+            head['OBSERVAT'] = 'YNAO'
+            head['TELESCOP'] = 'Lijiang 2.4m'
+            head['INSTRUME'] = 'YFOSC'
+            head['FILEID']   = logitem['fileid']
+            head['OBJECT']   = logitem['object']
+            head['EXPTIME']  = logitem['exptime']
+            head['DATEOBS']  = logitem['dateobs']
+            head['MODE']     = logitem['mode']
+            head['CONFIG']   = logitem['config']
+            head['SLIT']     = logitem['slit']
+            head['BINNING']  = logitem['binning']
+            head['GAIN']     = logitem['gain']
+            head['RDSPEED']  = logitem['rdspeed']
+            head['FITFUNC']  = 'GENGAUSSIAN'
+            head['WAVERMS']  = stdwave
+            head['NTOTAL']   = len(mask)
+            head['NUSED']    = mask.sum()
+            hdulst = fits.HDUList([
+                        fits.PrimaryHDU(header=head),
+                        fits.BinTableHDU(data=newtable),
+                        fits.BinTableHDU(data=linelist),
+                ])
+            hdulst.writeto('wlcalib_{}.fits'.format(logitem['fileid']),
+                           overwrite=True)
 
             # plot wavelength solution
             fig_sol = plt.figure(figsize=(12, 6), dpi=300)
@@ -759,6 +1183,8 @@ class YFOSC(FOSCReducer):
                             c='k', ls='-', lw=0.5, alpha=0.2)
 
             plt.show()
+
+    
 
     def get_conf(self, logitem):
         return (logitem['mode'], logitem['config'],

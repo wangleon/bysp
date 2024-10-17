@@ -4,7 +4,7 @@ import scipy.interpolate as intp
 import scipy.optimize as opt
 from scipy.signal import savgol_filter
 
-def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
+def iterative_savgol_filter(y, winlen=5, order=3, mode='interp', maxiter=10,
         upper_clip=None, lower_clip=None):
     """Smooth the input array with Savitzky-Golay filter with lower and/or
     upper clippings.
@@ -12,6 +12,7 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
     Args:
         y (:class:`numpy.ndarray`): Input array.
         winlen (int): Window length of Savitzky-Golay filter.
+        mode (str):
         order (int): Order of Savitzky-Gaoly filter.
         maxiter (int): Maximum number of iterations.
         lower_clip (float): Lower sigma-clipping value.
@@ -33,7 +34,7 @@ def iterative_savgol_filter(y, winlen=5, order=3, maxiter=10,
         # fill masked values in y using interpolation
         f = intp.InterpolatedUnivariateSpline(x[mask], y[mask], k=3)
         ysmooth = savgol_filter(f(x),
-                    window_length=winlen, polyorder=order, mode='mirror')
+                    window_length=winlen, polyorder=order, mode=mode)
         yres = y - ysmooth
         std = yres[mask].std()
 

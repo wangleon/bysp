@@ -1,5 +1,8 @@
 import os
+import numpy as np
 from astropy.table import Table
+
+from .imageproc import combine_images
 
 class FOSCReducer(object):
     
@@ -9,9 +12,13 @@ class FOSCReducer(object):
         if rawdata_path is not None and os.path.exists(rawdata_path):
             self.set_rawdata_path(rawdata_path)
 
-        reduction_path = kwargs.pop('reduction_path', None)
+        reduction_path = kwargs.pop('reduction_path', './')
         if reduction_path is not None:
             self.set_reduction_path(reduction_path)
+
+        obslogfile = kwargs.pop('obslog', None)
+        if obslogfile is not None:
+            self.read_obslog(obslogfile)
 
     def set_rawdata_path(self, rawdata_path):
         """Set rawdata path.
@@ -40,6 +47,21 @@ class FOSCReducer(object):
                             format='ascii.fixed_width_two_line')
         print(self.logtable)
 
+    def get_all_conf(self):
+        conf_lst = []
+        for logitem in self.logtable:
+            conf = self.get_conf(logitem)
+            if conf not in conf_lst:
+                conf_lst.append(conf)
+        self.conf_lst = conf_lst
+
+    def get_all_ccdconf(self):
+        ccdconf_lst = []
+        for logitem in self.logtable:
+            ccdconf = self.get_ccdconf(logitem)
+            if ccdconf not in ccdconf_lst:
+                ccdconf_lst.append(ccdconf)
+        self.ccdconf_lst = ccdconf_lst
 
     def combine_flat(self):
         """Combine flat images

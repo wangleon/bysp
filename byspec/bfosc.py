@@ -177,7 +177,6 @@ def select_calib_from_database(index_file, dateobs):
     md5    = row['md5']
 
     message = 'Select {} from database index as ThAr reference'.format(fileid)
-    #logger.info(message)
     print(message)
 
     filepath = os.path.join('calib/bfosc/', 'wlcalib_{}.fits'.format(fileid))
@@ -720,7 +719,6 @@ class BFOSC(FOSCReducer):
         ax4.imshow(sensmap)
 
         fits.writeto('sens.fits', sensmap, overwrite=True)
-
 
         plt.show()
 

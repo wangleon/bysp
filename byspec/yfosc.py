@@ -12,14 +12,15 @@ import astropy.io.fits as fits
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tck
+#from mpl_toolkits import mplot3d
 
 from .utils import get_file
 from .imageproc import combine_images
 from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         gaussian, gengaussian,
                         find_shift_ccf)
-from .common import FOSCReducer
-
+from .common import (FOSCReducer, find_distortion, correct_distortion,
+                     find_longslit_wavelength)
 
 def print_wrapper(string, item):
     """A wrapper for obslog printing
@@ -233,53 +234,17 @@ def get_longslit_sensmap(data):
 
     return sensmap
 
-def find_distortion(data):
-    ny, nx = data.shape
-    allx = np.arange(nx)
-    ally = np.arange(ny)
-    hwidth = 5
-    ref_spec = data[:, nx//2-hwidth:nx//2+hwidth].sum(axis=1)
-    
-    fig = plt.figure(dpi=200, figsize=(10,5))
-    ax1 = fig.add_axes([0.05, 0.53, 0.4, 0.42])
-    ax2 = fig.add_axes([0.05, 0.10, 0.4, 0.42])
-    ax3 = fig.add_axes([0.5, 0.1, 0.45, 0.85])
-
-    xcoord_lst = np.arange(200, nx-200, 200)
-    yshift_lst = []
-    for i, x in enumerate(xcoord_lst):
-        spec = data[:, x-hwidth:x+hwidth].sum(axis=1)
-        shift = find_shift_ccf(ref_spec, spec)
-        yshift_lst.append(shift)
-        if i==0:
-            ax1.plot(spec, color='w', lw=0)
-            y1, y2 = ax1.get_ylim()
-            offset = (y2-y1)/20
-        ycoord = np.arange(ny)
-        ax1.plot(ycoord, spec+offset*i, '-', lw=0.5)
-        ax2.plot(ycoord-shift, spec+offset*i, '-', lw=0.5)
-
-    ax1.set_xlim(0, ny-1)
-    ax2.set_xlim(0, ny-1)
-    coeff = np.polyfit(xcoord_lst, yshift_lst, deg=2)
-    ax3.plot(xcoord_lst, yshift_lst, 'o')
-    ax3.plot(allx, np.polyval(coeff, allx))
-    ax3.set_xlim(0, nx-1)
-
-    plt.show()
-
-def select_calib_from_database(index_file, lamp,  mode, config, dateobs):
+def select_calib_from_database(index_file, lamp, mode, config, dateobs):
     calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
 
     # select the corresponding arclamp, mode, and config
-    mask =  (calibtable['object'] == lamp) * \
-            (calibtable['mode']   == mode) * \
-            (calibtable['config'] == config)
+    mask = (calibtable['object'] == lamp) * \
+           (calibtable['mode']   == mode) * \
+           (calibtable['config'] == config)
 
     calibtable = calibtable[mask]
     
     input_date = dateutil.parser.parse(dateobs)
-
 
     # select the closest ThAr
     timediff = [(dateutil.parser.parse(t)-input_date).total_seconds()
@@ -299,9 +264,10 @@ def select_calib_from_database(index_file, lamp,  mode, config, dateobs):
     hdu_lst = fits.open(filename)
     head = hdu_lst[0].header
     spec = hdu_lst[1].data
+    linelist = Table(hdu_lst[2].data)
     hdu_lst.close()
 
-    return spec
+    return spec, linelist
 
 
 class YFOSC(FOSCReducer):
@@ -440,20 +406,6 @@ class YFOSC(FOSCReducer):
                 fits.writeto(sens_filename, sensmap, overwrite=True)
                 self.sensmap[conf] = sensmap
 
-    def find_longslit_distortion(self):
-        for logitem in self.logtable:
-            if logitem['mode']=='longslit' and logitem['datatype']=='LAMP':
-                ccdconf = self.get_ccdconf(logitem)
-                conf = self.get_conf(logitem)
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                data = trim_rawdata(data)
-                data = correct_overscan(data)
-                data = data - self.bias[ccdconf]
-                data = data / self.sensmap[conf]
-                
-                find_distortion(data)
-
     def extract_longslit_arclamp(self):
         self.arclamp = {}
         for logitem in self.logtable:
@@ -478,12 +430,137 @@ class YFOSC(FOSCReducer):
 
             ny, nx = data.shape
             halfwidth = 5
-            spec = data[:, nx//2-halfwidth: nx//2+halfwidth].mean(axis=1)
+            spec = data[:, nx//2-halfwidth:nx//2+halfwidth].mean(axis=1)
 
             self.arclamp[logitem['fileid']] = spec
 
     def ident_longslit_wavelength(self):
+        self.wave = {}
+        self.ident = {}
+        index_file = os.path.join(os.path.dirname(__file__),
+                              'data/calib/wlcalib_yfosc.dat')
 
+        for logitem in self.logtable:
+            if logitem['mode']!='longslit' or logitem['datatype']!='LAMP':
+                continue
+            if logitem['fileid'] not in self.arclamp:
+                continue
+
+            fileid = logitem['fileid']
+            lamp   = logitem['object']
+
+            spec = self.arclamp[fileid]
+
+            ref_data, linelist = select_calib_from_database(index_file,
+                                lamp = lamp,
+                                mode = logitem['mode'],
+                                config = logitem['config'],
+                                dateobs = logitem['dateobs'],
+                                )
+            ref_wave = ref_data['wavelength']
+            ref_flux = ref_data['flux']
+
+            #filename = os.path.join(os.path.dirname(__file__),
+            #                        'data/linelist/{}.dat'.format(lamp))
+            #linelist = Table.read(filename, format='ascii.fixed_width_two_line')
+            linelist = linelist['wave_air', 'element', 'ion', 'source']
+
+            window = 17
+            deg = 4
+            clipping = 3
+            q_threshold = 5
+
+            result = find_longslit_wavelength(
+                    spec, ref_wave, ref_flux, (-50, 50),
+                    linelist    = linelist,
+                    window      = window,
+                    deg         = deg,
+                    q_threshold = q_threshold,
+                    clipping    = clipping,
+                    )
+
+            allwave  = result['wavelength']
+            linelist = result['linelist']
+            stdwave  = result['std']
+            fig_sol  = result['fig_solution']
+
+            # save line-by-line fit figure
+            fig_lbl_lst = result['fig_fitlbl']
+            if len(fig_lbl_lst)==1:
+                fig_lbl = fig_lbl_lst[0]
+                title = 'Line-by-line fit of {} ({})'.format(fileid, lamp)
+                fig_lbl.suptitle(title)
+                figname = 'linefit_lbl_{}.png'.format(fileid)
+                figfilename = os.path.join(self.reduction_path, figname)
+                fig_lbl.savefig(figfilename)
+                plt.close(fig_lbl)
+            else:
+                for ifig, fig_lbl in enumerate(fig_lbl_lst):
+                    # add figure title
+                    title = 'Line-by-line fit of {} ({}, {} of {})'.format(
+                            fileid, lamp, ifig+1, len(fig_lbl_lst))
+                    fig_lbl.suptitle(title)
+                    figname = 'linefit_lbl_{}_{:02d}.png'.format(
+                            fileid, ifig+1)
+                    figfilename = os.path.join(self.reduction_path, figname)
+                    fig_lbl.savefig(figfilename)
+                    plt.close(fig_lbl)
+
+            # save wavelength solution figure
+            # add title
+            title = 'Wavelength Solution for {} ({})'.format(fileid, lamp)
+            fig_sol.suptitle(title)
+            figname = 'wlcalib_{}.png'.format(fileid)
+            figfilename = os.path.join(self.reduction_path, figname)
+            fig_sol.savefig(figfilename)
+            plt.close(fig_sol)
+
+            # prepare the wavelength calibrated arc lamp spectra
+            newtable = Table([allwave, spec], names=['wavelength', 'flux'])
+
+            ntotal = len(linelist)
+            nused = sum(list(linelist['use']))
+
+            # prepare the FITS header
+            head = fits.Header()
+            head['OBSERVAT'] = 'YNAO'
+            head['TELESCOP'] = 'Lijiang 2.4m'
+            head['INSTRUME'] = 'YFOSC'
+            head['FILEID']   = fileid
+            head['OBJECT']   = lamp
+            head['EXPTIME']  = logitem['exptime']
+            head['DATEOBS']  = logitem['dateobs']
+            head['MODE']     = logitem['mode']
+            head['CONFIG']   = logitem['config']
+            head['SLIT']     = logitem['slit']
+            head['BINNING']  = logitem['binning']
+            head['GAIN']     = logitem['gain']
+            head['RDSPEED']  = logitem['rdspeed']
+            head['FITFUNC']  = 'GENGAUSSIAN'
+            head['WINDOW']   = window
+            head['FITDEG']   = deg
+            head['CLIPPING'] = clipping
+            head['QTHOLD']   = q_threshold
+            head['WAVERMS']  = stdwave
+            head['NTOTAL']   = ntotal
+            head['NUSED']    = nused
+            hdulst = fits.HDUList([
+                        fits.PrimaryHDU(header=head),
+                        fits.BinTableHDU(data=newtable),
+                        fits.BinTableHDU(data=linelist),
+                ])
+            hdulst.writeto('wlcalib_{}.fits'.format(fileid),
+                           overwrite=True)
+
+            self.wave[logitem['fileid']] = allwave
+            self.ident[logitem['fileid']] = linelist
+
+
+
+    def ident_longslit_wavelength1(self):
+
+        self.wave = {}
+        self.ident = {}
         index_file = os.path.join(os.path.dirname(__file__),
                               'data/calib/wlcalib_yfosc.dat')
 
@@ -623,7 +700,7 @@ class YFOSC(FOSCReducer):
                 fitres = opt.least_squares(errfunc, p0,
                             bounds=(lower_bounds, upper_bounds),
                             args=(xdata, ydata, fitline),
-                            )
+                )
 
                 param = fitres['x']
 
@@ -822,6 +899,8 @@ class YFOSC(FOSCReducer):
                 ax2.axvline(w, ymin=0.9, ymax=1,
                             c='k', ls='-', lw=0.5, alpha=0.2)
 
+            self.wave[logitem['fileid']] = allwave
+            self.ident[logitem['fileid']] = linelist
             plt.show()
 
     def ident_longslit_wavelength2(self):
@@ -1184,7 +1263,37 @@ class YFOSC(FOSCReducer):
 
             plt.show()
 
-    
+    def find_longslit_distortion(self):
+
+        for logitem in self.logtable:
+            if logitem['mode']!='longslit' or logitem['datatype']!='LAMP':
+                continue
+
+            ccdconf = self.get_ccdconf(logitem)
+            conf = self.get_conf(logitem)
+
+            filename = self.fileid_to_filename(logitem['fileid'])
+            data = fits.getdata(filename)
+            data = trim_rawdata(data)
+            data = correct_overscan(data)
+            data = data - self.bias[ccdconf]
+            data = data / self.sensmap[conf]
+            data = trim_longslit(data)
+
+            allwave = self.wave[logitem['fileid']]
+            linelist = self.ident[logitem['fileid']]
+
+            distortion = find_distortion(data, hwidth=5, disp_axis='y',
+                                         wave=allwave, linelist=linelist,
+                                         deg=4, xorder=4, yorder=4)
+
+            newdata = correct_distortion(data, distortion)
+            fig = plt.figure()
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+            ax1.imshow(data)
+            ax2.imshow(newdata)
+            plt.show()
 
     def get_conf(self, logitem):
         return (logitem['mode'], logitem['config'],

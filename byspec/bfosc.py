@@ -20,7 +20,7 @@ from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         get_local_minima)
 from .visual import plot_image_with_hist
 
-from .common import FOSCReducer
+from .common import FOSCReducer, find_longslit_wavelength
 
 def print_wrapper(string, item):
     """A wrapper for obslog printing
@@ -163,20 +163,27 @@ def get_mosaic_fileid(obsdate, dateobs):
                                            delta_minutes)
     return newid
 
-def select_calib_from_database(index_file, dateobs):
+def select_calib_from_database(index_file, lamp, mode, config, dateobs):
     calibtable = Table.read(index_file, format='ascii.fixed_width_two_line')
+
+    # select the corresponding arclamp, mode, and config
+    mask = (calibtable['object'] == lamp) * \
+           (calibtable['mode']   == mode) * \
+           (calibtable['config'] == config)
+
+    calibtable = calibtable[mask]
 
     input_date = dateutil.parser.parse(dateobs)
 
     # select the closest ThAr
     timediff = [(dateutil.parser.parse(t)-input_date).total_seconds()
-                for t in calibtable['obsdate']]
+                for t in calibtable['dateobs']]
     irow = np.abs(timediff).argmin()
     row = calibtable[irow]
     fileid = row['fileid']  # selected fileid
     md5    = row['md5']
 
-    message = 'Select {} from database index as ThAr reference'.format(fileid)
+    message = 'Select {} from database index as {} reference'.format(fileid, lamp)
     print(message)
 
     filepath = os.path.join('calib/bfosc/', 'wlcalib_{}.fits'.format(fileid))
@@ -186,9 +193,10 @@ def select_calib_from_database(index_file, dateobs):
     hdu_lst = fits.open(filename)
     head = hdu_lst[0].header
     spec = hdu_lst[1].data
+    linelist = Table(hdu_lst[2].data)
     hdu_lst.close()
 
-    return spec
+    return spec, linelist
 
 def find_echelle_apertures(data, align_deg, scan_step):
     ny, nx = data.shape
@@ -494,15 +502,27 @@ def find_echelle_apertures(data, align_deg, scan_step):
     return coeff_lst, goodmask
 
 
+def get_longslit_sensmap(data):
+    ny, nx = data.shape
+    allx = np.arange(nx)
+    ally = np.arange(ny)
+    sensmap = np.ones_like(data, dtype=np.float64)
+
+    for y in np.arange(ny):
+        #fluxt1d = self.flat_data[y, 20:int(nx) - 20]
+        flux1d = data[y, :]
+        flux1d_sm, _, mask, std = iterative_savgol_filter(
+                                    flux1d,
+                                    winlen=51, order=3, mode='interp',
+                                    upper_clip=6, lower_clip=6, maxiter=10)
+        sensmap[y, :] = flux1d/flux1d_sm
+
+    return sensmap
+
+
 class BFOSC(FOSCReducer):
     def __init__(self, **kwargs):
         super(BFOSC, self).__init__(**kwargs)
-
-    def set_mode(self, mode):
-        if mode not in ['longslit', 'echelle']:
-            raise ValueError
-        self.mode = mode
-
 
     def make_obslog(self, filename=None):
         """Scan the raw data path and generate an observing log.
@@ -513,14 +533,12 @@ class BFOSC(FOSCReducer):
         self.obsdate = logtable[0]['dateobs'][0:10]
 
         if filename is None:
-            filename = 'bfosc.{}.txt'.format(self.obsdate)
+            filename = 'BFOSC.{}.txt'.format(self.obsdate)
         filename = os.path.join(self.reduction_path, filename)
 
         logtable.write(filename, format='ascii.fixed_width_two_line',
                         overwrite=True)
         self.logtable = logtable
-
-        self.find_calib_groups()
 
     def fileid_to_filename(self, fileid):
         for fname in os.listdir(self.rawdata_path):
@@ -534,7 +552,8 @@ class BFOSC(FOSCReducer):
         self.bias = {}
 
         for ccdconf in self.ccdconf_lst:
-            bias_file = 'bias_{}.fits'.format(ccdconf)
+            ccdconf_string = self.get_ccdconf_string(ccdconf)
+            bias_file = 'bias_{}.fits'.format(ccdconf_string)
             bias_filename = os.path.join(self.reduction_path, bias_file)
             if os.path.exists(bias_filename):
                 hdulst = fits.open(bias_filename)
@@ -543,13 +562,15 @@ class BFOSC(FOSCReducer):
                 hdulst.close()
             else:
                 print('Combine bias')
-                data_lst = []
                 selectfunc = lambda item: item['datatype']=='BIAS' and \
-                                self.get_ccdconf_string(item)==ccdconf
+                                self.get_ccdconf(item)==ccdconf
 
-                bias_item_lst = filter(selectfunc, self.logtable)
+                item_lst = list(filter(selectfunc, self.logtable))
+                if len(item_lst)==0:
+                    continue
                 
-                for logitem in bias_item_lst:
+                data_lst = []
+                for logitem in item_lst:
                     filename = self.fileid_to_filename(logitem['fileid'])
                     data = fits.getdata(filename)
                     data_lst.append(data)
@@ -576,6 +597,44 @@ class BFOSC(FOSCReducer):
                 hdulst.writeto(bias_filename, overwrite=True)
 
             self.bias[ccdconf] = bias_img
+
+    def combine_flat(self):
+        """Combine flat images
+        """
+
+        self.get_all_conf()
+        self.flat = {}
+
+        for conf in self.conf_lst:
+            conf_string = self.get_conf_string(conf)
+            flat_file = 'flat_{}.fits'.format(conf_string)
+            flat_filename = os.path.join(self.reduction_path, flat_file)
+            if os.path.exists(flat_filename):
+                flat_data = fits.getdata(flat_filename)
+            else:
+                selectfunc = lambda item: item['object']=='FLAT' and \
+                                self.get_conf(item)==conf
+
+                item_lst = list(filter(selectfunc, self.logtable))
+
+                if len(item_lst)==0:
+                    continue
+
+                print('Combine Flat for {}'.format(conf_string))
+
+                data_lst = []
+                for logitem in item_lst:
+                    filename = self.fileid_to_filename(logitem['fileid'])
+                    data = fits.getdata(filename)
+                    ccdconf = self.get_ccdconf(logitem)
+                    data = data - self.bias[ccdconf]
+                    data_lst.append(data)
+                data_lst = np.array(data_lst)
+
+                flat_data = combine_images(data_lst, mode='mean',
+                                    upper_clip=5, maxiter=10, maskmode='max')
+                fits.writeto(flat_filename, flat_data, overwrite=True)
+            self.flat[conf] = flat_data
 
     def plot_bias(self, show=True):
         figfilename = os.path.join(self.figpath, 'bias.png')
@@ -604,9 +663,21 @@ class BFOSC(FOSCReducer):
                         title       = title,
                         )
 
-    def get_conf_string(self, logitem):
-        return '{mode}.{config}.{binning}.{gain:3.1f}.{rdnoise:3.2f}'.format(
-                **logitem)
+    def get_conf(self, logitem):
+        return (logitem['mode'], logitem['config'],
+                logitem['binning'], logitem['gain'], logitem['rdnoise'])
+    
+    def get_conf_string(self, conf):
+        mode, config, binning, gain, rdspeed = conf
+        return '{}_{}_{}_gian{:3.1f}.ron{:.1f}'.format(mode, config, binning,
+                                                       gain, rdspeed)
+
+    def get_ccdconf(self, logitem):
+        return (logitem['binning'], logitem['gain'], logitem['rdnoise'])
+
+    def get_ccdconf_string(self, ccdconf):
+        binning, gain, rdnoise = ccdconf
+        return '{}_gain{:.1f}_ron{}'.format(binning, gain, rdnoise)
 
     def trace(self):
         if self.mode != 'echelle':
@@ -724,26 +795,17 @@ class BFOSC(FOSCReducer):
 
         self.sens_data = sensmap
 
-    def get_sens(self):
-        ny, nx = self.flat_data.shape
-        allx = np.arange(nx)
-        # x axis is the main-dispersion axis
-        self.ndisp = nx
-        flat_sens = np.ones_like(self.flat_data, dtype=np.float64)
-
-        for y in np.arange(ny):
-            #flat1d = self.flat_data[y, 20:int(nx) - 20]
-            flat1d = self.flat_data[y, :]
-
-            flat1d_sm, _, mask, std = iterative_savgol_filter(flat1d,
-                                        winlen=51, order=3,
-                                        upper_clip=6, lower_clip=6, maxiter=10)
-            #flat_sens[y, 20:int(nx) - 20] = flat1d / flat1d_sm
-            flat_sens[y, :] = flat1d / flat1d_sm
-
-        fits.writeto(self.sens_file, flat_sens, overwrite=True)
-
-        self.sens_data = flat_sens
+    def get_longslit_sens(self):
+        self.sensmap = {}
+        for conf, flat_data in self.flat.items():
+            mode = conf[0]
+            conf_string = self.get_conf_string(conf)
+            if mode == 'longslit':
+                sensmap = get_longslit_sensmap(flat_data)
+                sens_file = 'sens_{}.fits'.format(conf_string)
+                sens_filename = os.path.join(self.reduction_path, sens_file)
+                fits.writeto(sens_filename, sensmap, overwrite=True)
+                self.sensmap[conf] = sensmap
 
 
     def extract_echelle_lamp(self):
@@ -823,6 +885,127 @@ class BFOSC(FOSCReducer):
             spec_lst[fileid] = {'wavelength': None, 'flux': spec}
 
         self.lamp_spec_lst = spec_lst
+
+    def ident_longslit_wavelength(self):
+
+        index_file = os.path.join(os.path.dirname(__file__),
+                                  'data/calib/wlcalib_bfosc.dat')
+
+        for logitem in self.logtable:
+            if logitem['mode']!='longslit' or logitem['datatype']!='SPECLLAMP':
+                continue
+            if logitem['fileid'] not in self.arclamp:
+                continue
+
+            fileid = logitem['fileid']
+            lamp   = logitem['object']
+
+            spec = self.arclamp[fileid]
+
+            ref_data, linelist = select_calib_from_database(index_file,
+                                lamp = lamp,
+                                mode = logitem['mode'],
+                                config = logitem['config'],
+                                dateobs = logitem['dateobs'],
+                                )
+            ref_wave = ref_data['wavelength']
+            ref_flux = ref_data['flux']
+
+            #filename = os.path.join(os.path.dirname(__file__),
+            #                        'data/linelist/{}_l.dat'.format(lamp))
+            #linelist = Table.read(filename, format='ascii.fixed_width_two_line')
+            #linelist = linelist[np.where(linelist['intlev']<=3)]
+
+            linelist = linelist['wave_air', 'element', 'ion', 'source']
+
+            window = 17
+            deg = 5
+            clipping = 3
+            q_threshold = 5
+
+            result = find_longslit_wavelength(
+                    spec, ref_wave, ref_flux, (-50, 50),
+                    linelist    = linelist,
+                    window      = window,
+                    deg         = deg,
+                    q_threshold = q_threshold,
+                    clipping    = clipping,
+                    )
+
+            allwave  = result['wavelength']
+            linelist = result['linelist']
+            stdwave  = result['std']
+            fig_sol  = result['fig_solution']
+
+            # save line-by-line fit figure
+            fig_lbl_lst  = result['fig_fitlbl']
+            if len(fig_lbl_lst)==1:
+                fig_lbl = fig_lbl_lst[0]
+                title = 'Line-by-line fit of {} ({})'.format(fileid, lamp)
+                fig_lbl.suptitle(title)
+                figname = 'linefit_lbl_{}.png'.format(fileid)
+                figfilename = os.path.join(self.reduction_path, figname)
+                fig_lbl.savefig(figfilename)
+                plt.close(fig_lbl)
+            else:
+                for ifig, fig_lbl in enumerate(fig_lbl_lst):
+                    # add figure title
+                    title = 'Line-by-line fit of {} ({}, {} of {})'.format(
+                            fileid, lamp, ifig+1, len(fig_lbl_lst))
+                    fig_lbl.suptitle(title)
+                    figname = 'linefit_lbl_{}_{:02d}.png'.format(
+                            fileid, ifig+1)
+                    figfilename = os.path.join(self.reduction_path, figname)
+                    fig_lbl.savefig(figfilename)
+                    plt.close(fig_lbl)
+
+
+            # save wavelength solution figure
+            # add title
+            title = 'Wavelength Solution for {} ({})'.format(fileid, lamp)
+            fig_sol.suptitle(title)
+            figname = 'wlcalib_{}.png'.format(fileid)
+            figfilename = os.path.join(self.reduction_path, figname)
+            fig_sol.savefig(figfilename)
+            plt.close(fig_sol)
+
+            # prepare the wavelength calibrated arc lamp spectra
+            newtable = Table([allwave, spec], names=['wavelength', 'flux'])
+
+            ntotal = len(linelist)
+            nused = sum(list(linelist['use']))
+
+            # prepare the FITS header
+            head = fits.Header()
+            head['OBSERVAT'] = 'Xinglong'
+            head['TELESCOP'] = 'Xinglong 2.16m'
+            head['INSTRUME'] = 'BFOSC'
+            head['FILEID']   = fileid
+            head['OBJECT']   = lamp
+            head['EXPTIME']  = logitem['exptime']
+            head['DATEOBS']  = logitem['dateobs']
+            head['MODE']     = logitem['mode']
+            head['CONFIG']   = logitem['config']
+            head['SLIT']     = logitem['slit']
+            head['BINNING']  = logitem['binning']
+            head['GAIN']     = logitem['gain']
+            head['RDNOISE']  = logitem['rdnoise']
+            head['FITFUNC']  = 'GENGAUSSIAN'
+            head['WINDOW']   = window
+            head['FITDEG']   = deg
+            head['CLIPPING'] = clipping
+            head['QTHOLD']   = q_threshold
+            head['WAVERMS']  = stdwave
+            head['NTOTAL']   = ntotal
+            head['NUSED']    = nused
+            hdulst = fits.HDUList([
+                        fits.PrimaryHDU(header=head),
+                        fits.BinTableHDU(data=newtable),
+                        fits.BinTableHDU(data=linelist),
+                ])
+            hdulst.writeto('wlcalib_{}.fits'.format(fileid),
+                           overwrite=True)
+
 
     def identify_wavelength(self):
         pixel_lst = np.arange(self.ndisp)
@@ -1101,24 +1284,6 @@ class BFOSC(FOSCReducer):
         ax1.set_xlabel(u'Wavelength (\xc5)')
         plt.show()
     
-    def find_calib_groups(self):
-
-        lamp_lst = {}
-        for logitem in self.logtable:
-            if logitem['datatype'] != 'SPECLLAMP':
-                continue
-            _objname = logitem['object']
-            if _objname not in lamp_lst:
-                lamp_lst[_objname] = []
-            lamp_lst[_objname].append(logitem)
-
-        groups = []
-        for lamp, lamp_item_lst in lamp_lst.items():
-            logitem_groups = group_caliblamps(lamp_item_lst)
-            for logitem_lst in logitem_groups:
-                groups.append(logitem_lst)
-        self.calib_groups = groups
-
     def find_distortion(self):
 
         wavebound = 6907
@@ -1214,8 +1379,34 @@ class BFOSC(FOSCReducer):
         # take the average of coeff_lst as final curve_coeff
         self.curve_coeff = np.array(coeff_lst).mean(axis=0)
 
+    def extract_longslit_arclamp(self):
+        self.arclamp = {}
+        for logitem in self.logtable:
+            if logitem['mode'] != 'longslit':
+                continue
 
+            if logitem['datatype'] != 'SPECLLAMP':
+                continue
 
+            ccdconf = self.get_ccdconf(logitem)
+            conf = self.get_conf(logitem)
+
+            filename = self.fileid_to_filename(logitem['fileid'])
+            data = fits.getdata(filename)
+            data = data - self.bias[ccdconf]
+            data = data / self.sensmap[conf]
+
+            ny, nx = data.shape
+            halfwidth = 5
+            spec = data[ny//2-halfwidth:ny//2+halfwidth, :].mean(axis=0)
+
+            self.arclamp[logitem['fileid']] = spec
+
+            fig = plt.figure()
+            ax = fig.gca()
+            ax.plot(spec, lw=0.5)
+            plt.show()
+        
 
     def extract_all_science(self):
         func = lambda item: item['datatype']=='SPECLTARGET'

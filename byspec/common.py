@@ -1,8 +1,14 @@
 import os
 import numpy as np
 from astropy.table import Table
+import scipy.optimize as opt
+import scipy.interpolate as intp
+import matplotlib.pyplot as plt
+import matplotlib.ticker as tck
 
 from .imageproc import combine_images
+from .onedarray import gengaussian, get_simple_ccf
+from .regression import polyfit2d, polyval2d
 
 class FOSCReducer(object):
     
@@ -99,3 +105,595 @@ class FOSCReducer(object):
                                     upper_clip=5, maxiter=10, maskmode='max')
                 fits.writeto(flat_filename, flat_data, ovewrite=True)
                 self.flat_data[_conf] = flat_data
+
+
+class Distortion(object):
+
+    def __init__(self, coeff, nx, ny, disp_axis):
+        self.coeff = coeff
+        self.nx = nx
+        self.ny = ny
+        self.disp_axis = disp_axis
+        
+
+def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
+                    xorder, yorder):
+
+    if disp_axis == 'x':
+        data = data.T
+    elif disp_axis == 'y':
+        pass
+    else:
+        raise ValueError
+
+    def errfunc(p, x, y, fitfunc):
+        return y - fitfunc(p, x)
+    def fitline(p, x):
+        nline = int((len(p)-1)/4)
+        y = np.ones_like(x, dtype=np.float64) + p[0]
+        for i in range(nline):
+            A, alpha, beta, center = p[i*4+1:i*4+5]
+            y = y + gengaussian(A, alpha, beta, center, x)
+        return y
+
+    ny, nx = data.shape
+    allx = np.arange(nx)
+    ally = np.arange(ny)
+
+    # get the central spectra as reference
+    spec0 = data[:, nx//2-hwidth:nx//2+hwidth].mean(axis=1)
+
+    all_x_lst, all_y_lst, all_dc_lst, all_w_lst = [], [], [], []
+
+    # scan the slit direction every 200 columns
+    for x in np.arange(100, nx-100, 200):
+
+        y_lst, w_lst, dc_lst, m_lst = [], [], [], []
+
+        # get the spectra
+        spec1 = data[:, x-hwidth:x+hwidth].mean(axis=1)
+
+        # fig0 is the line-by-line figure
+        #fig0 = plt.figure(figsize=(16,9), dpi=200,tight_layout=True)
+
+        #newlines = linelist[np.where(linelist['use']==1)]
+        count_line = 0
+        #for fitid in np.unique(list(newlines['fitid'])):
+        for fitid in np.unique(list(linelist['fitid'])):
+            lines = linelist[np.where(linelist['fitid']==fitid)]
+            # get the original i1 and i2
+            i1o = lines[0]['i1']
+            i2o = lines[0]['i2']
+
+            # calculte local shift
+            ico = int((i1o+i2o)/2)
+            j1 = max(i1o-100, 0)
+            j2 = min(i1o+100, spec1.size)
+            shift_lst = np.arange(-50, 50)
+            ccf0_lst = get_simple_ccf(spec1[j1:j2], spec0[j1:j2],
+                        shift_lst)
+            s0 = shift_lst[ccf0_lst.argmax()]
+
+            i1 = int(i1o + s0)
+            i2 = int(i2o + s0)
+
+            xdata = np.arange(i1, i2)
+            ydata = spec1[i1:i2]
+
+            if ydata.argmax()==0 or ydata.argmax()==i2-i1-1:
+                continue
+            p0 = [lines[0]['bkg']]
+            lower_bounds = [-np.inf]
+            upper_bounds = [np.inf]
+
+            for line in lines:
+                p0.append(line['A'])
+                p0.append(line['alpha'])
+                p0.append(line['beta'])
+                p0.append(line['pixel'] + s0)
+                lower_bounds.append(0)
+                lower_bounds.append(0.5)
+                lower_bounds.append(0.1)
+                #lower_bounds.append(line['pixel']+s0-15)
+                lower_bounds.append(i1)
+                upper_bounds.append(np.inf)
+                upper_bounds.append(20)
+                upper_bounds.append(20)
+                #upper_bounds.append(line['pixel']+s0+15)
+                upper_bounds.append(i2)
+
+            fitres = opt.least_squares(errfunc, p0,
+                    bounds=(lower_bounds, upper_bounds),
+                    args=(xdata, ydata, fitline),
+                    )
+            count_line += 1
+            param = fitres['x']
+            nline = int((len(param)-1)/4)
+            bkg = param[0]
+            std = np.sqrt(fitres['cost']*2/xdata.size)
+            for i in range(nline):
+                A, alpha, beta, center = param[i*4+1:i*4+5]
+                dc = center - lines[i]['pixel']
+                wave = lines[i]['wave_air']
+                #print(x, shift0, center)
+                if A/std < 5 or \
+                    abs(alpha - upper_bounds[i*4+2])<1e-2 or \
+                    abs(beta - upper_bounds[i*4+3])<1e-2:
+                    mask = False
+                else:
+                    mask = True
+                print(x, '{:2d}'.format(count_line),
+                      '{:5.2f}'.format(center-i1),
+                      '{:5.2f}'.format(i2-center),
+                      '{:6.3f}'.format(alpha),
+                      '{:6.3f}'.format(beta),
+                      '{:7.2f}'.format(center), mask,
+                      A/std)
+
+                m_lst.append(mask)
+                y_lst.append(center)
+                w_lst.append(wave)
+                dc_lst.append(dc)
+
+            # draw the fitting line-by0line
+            #ax0 = fig0.add_subplot(6,7, count_line)
+            #ax0.plot(xdata, ydata*1e-3, 'o', ms=3)
+            #newx = np.linspace(xdata[0], xdata[-1], 100)
+            #newy = fitline(param, newx)
+            #ax0.plot(newx, newy*1e-3)
+        #fig0.savefig('align_x_{:04d}.png'.format(x))
+        #plt.close(fig0)
+
+        m_lst = np.array(m_lst)
+        y_lst = np.array(y_lst)
+        w_lst = np.array(w_lst)
+        dc_lst = np.array(dc_lst)
+
+        # fit the wavelength solution column by column
+        # initialize the mask
+        m = m_lst.copy()
+
+        # plot the wavelength solution column-by-column
+        figsol = plt.figure(dpi=200)
+        axs1 = figsol.add_subplot(211)
+        axs2 = figsol.add_subplot(212)
+
+        for i in range(10):
+            coeff = np.polyfit(y_lst[m], w_lst[m], deg=deg)
+            allw = np.polyval(coeff, ally)
+            res_lst = w_lst - np.polyval(coeff, y_lst)
+            std = res_lst[m].std()
+            newm = (np.abs(res_lst)<3*std)*m_lst
+            if newm.sum()==m.sum():
+                break
+            else:
+                m = newm
+        axs1.plot(y_lst[m], w_lst[m], 'o', c='C0', alpha=0.8)
+        axs1.plot(y_lst[~m], w_lst[~m], 'o', c='none', mec='C0')
+        axs1.plot(ally, np.polyval(coeff, ally), '-', lw=0.5)
+        axs2.plot(y_lst[m], res_lst[m], 'o', alpha=0.8)
+        axs2.plot(y_lst[~m], res_lst[~m], 'o', c='none', mec='C0')
+        axs1.set_xlim(0, ny-1)
+        axs2.set_xlim(0, ny-1)
+        axs2.axhline(0, c='k', ls='-', lw=0.5)
+        axs2.axhline(std, c='k', ls='--', lw=0.5)
+        axs2.axhline(-std, c='k', ls='--', lw=0.5)
+        axs2.set_ylim(-6*std, 6*std)
+        figsol.savefig('sol_{:04d}.png'.format(x))
+        plt.close(figsol)
+
+        for y, w, dc in zip(y_lst[m], w_lst[m], dc_lst[m]):
+            all_x_lst.append(x)
+            all_y_lst.append(y)
+            all_w_lst.append(w)
+            all_dc_lst.append(dc)
+
+    all_x_lst = np.array(all_x_lst)
+    all_y_lst = np.array(all_y_lst)
+    all_w_lst = np.array(all_w_lst)
+    all_dc_lst = np.array(all_dc_lst)
+
+    # plot the 3d fitting
+    fig = plt.figure()
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax2 = fig.add_subplot(122, projection='3d')
+    #ax1.scatter(all_x_lst, all_y_lst, all_dc_lst)
+    #ax2.scatter(all_x_lst, all_y_lst, all_w_lst)
+
+    m = np.ones_like(all_x_lst, dtype=bool)
+    for i in range(3):
+        coeff = polyfit2d(all_x_lst[m]/nx, all_y_lst[m]/ny, all_dc_lst[m],
+                      xorder=xorder, yorder=yorder)
+        res_lst = all_dc_lst - polyval2d(coeff, all_x_lst/nx, all_y_lst/ny)
+        std = res_lst[m].std()
+        newm = np.abs(res_lst)<3*std
+        if newm.sum()==m.sum():
+            break
+        else:
+            m = newm
+
+    ax1.scatter(all_x_lst[m], all_y_lst[m], all_dc_lst[m], c='C0')
+    ax1.scatter(all_x_lst[~m], all_y_lst[~m], all_dc_lst[~m], c='C3')
+    ax2.scatter(all_x_lst[m], all_y_lst[m], all_w_lst[m], c='C0')
+    ax2.scatter(all_x_lst[~m], all_y_lst[~m], all_w_lst[~m], c='C0')
+
+    # plot the surface
+    yy, xx = np.mgrid[:ny:, :nx:]
+    zz = polyval2d(coeff, xx/nx, yy/ny)
+    ax1.plot_surface(xx, yy, zz, lw=0.5, alpha=0.5)
+    
+    fig1 = plt.figure(dpi=150, figsize=(16,9))
+    ax0 = fig1.add_axes([0.08, 0.1, 0.4, 0.8])
+    ax1 = fig1.add_axes([0.6, 0.6, 0.35, 0.31])
+    ax2 = fig1.add_axes([0.6, 0.1, 0.35, 0.31])
+    # plot difference
+    cax = ax0.imshow(zz, origin='lower')
+    ax0.contour(zz, lw=0.5, c='k')
+    bbox0 = ax0.get_position()
+    # add color bar
+    axc = fig1.add_axes([bbox0.x1+0.02, bbox0.y0, 0.015, bbox0.height])
+    fig1.colorbar(cax, cax=axc)
+    # plot residuals
+    bbox1 = ax1.get_position()
+    ax1.set_position([bbox1.x0, bbox0.y1-bbox1.height, bbox1.width, bbox1.height])
+    bbox2 = ax2.get_position()
+    ax2.set_position([bbox2.x0, bbox0.y0, bbox1.width, bbox1.height])
+    ax1.plot(all_x_lst[m],  res_lst[m],  'o', ms=2, c='C0', alpha=0.6)
+    ax1.plot(all_x_lst[~m], res_lst[~m], 'o', ms=2, c='C3', alpha=0.6)
+    ax2.plot(all_y_lst[m],  res_lst[m],  'o', ms=2, c='C0', alpha=0.6)
+    ax2.plot(all_y_lst[~m], res_lst[~m], 'o', ms=2, c='C3', alpha=0.6)
+    ax1.set_xlabel('X (pixel)')
+    ax2.set_xlabel('Y (pixel)')
+    ax1.set_xlim(0, nx-1)
+    ax2.set_xlim(0, ny-1)
+    for ax in [ax1, ax2]:
+        ax.set_ylim(-6*std, 6*std)
+        ax.axhline(0, c='k', ls='-', lw=0.5, zorder=-1)
+        ax.axhline(-std, c='k', ls='--', lw=0.5, zorder=-1)
+        ax.axhline(std, c='k', ls='--', lw=0.5, zorder=-1)
+
+    # plot the distortion curve
+    fig3 = plt.figure()
+    ax3 = fig3.gca()
+    #ax3.imshow(np.log10(data), cmap='gray')
+    for y in np.linspace(0, ny-1, 10):
+        x_lst = np.linspace(0, nx-1, 100)
+        y_lst = np.repeat(y, x_lst.size)
+        #ax3.plot(x_lst, y_lst, '-', lw=0.5)
+        dc_lst = polyval2d(coeff, x_lst/nx, y_lst/ny)
+        ax3.plot(x_lst, y_lst, '--', c='k', lw=0.5)
+        ax3.plot(x_lst, y_lst+dc_lst*10, '-', c='k', lw=0.5)
+
+    plt.show()
+
+    if disp_axis=='x':
+        return Distortion(coeff, nx=ny, ny=nx, disp_axis=disp_axis)
+    elif disp_axis=='y':
+        return Distortion(coeff, nx=nx, ny=ny, disp_axis=disp_axis)
+    else:
+        raise ValueError
+
+def correct_distortion(data, distortion):
+    ny, nx = data.shape
+    if (nx, ny) != (distortion.nx, distortion.ny):
+        raise ValueError
+
+    newdata = np.zeros_like(data)
+    ally = np.arange(ny)
+
+    yy, xx = np.mgrid[:ny:, :nx:]
+    dc = polyval2d(distortion.coeff, xx/nx, yy/ny)
+
+    for x in np.arange(nx):
+        dc_lst = dc[:, x]
+        flux = data[:, x]
+        func = intp.InterpolatedUnivariateSpline(
+                ally-dc_lst, flux, k=3, ext=1)
+        newdata[:, x] = func(ally)
+    return newdata
+
+
+def find_longslit_wavelength(spec, ref_wave, ref_flux, shift_range, linelist,
+        window=17, deg=4, clipping=3, q_threshold=0):
+
+    def errfunc(p, x, y, fitfunc):
+        return y - fitfunc(p, x)
+    def fitline(p, x):
+        nline = int((len(p)-1)/4)
+        y = np.ones_like(x, dtype=np.float64) + p[0]
+        for i in range(nline):
+            A, alpha, beta, center = p[i*4+1:i*4+5]
+            y = y + gengaussian(A, alpha, beta, center, x)
+        return y
+    
+    ref_pixel = np.arange(ref_wave.size)
+
+    shift_lst = np.arange(shift_range[0], shift_range[1])
+    ccf_lst = get_simple_ccf(spec, ref_flux, shift_lst)
+    shift = shift_lst[ccf_lst.argmax()]
+
+    # construct an interpolate function that converts wavelength to pixel
+    # before constructing the function, the reference wavelength should be
+    # increased
+    if ref_wave[0] > ref_wave[-1]:
+        ref_wave = ref_wave[::-1]
+        ref_flux = ref_flux[::-1]
+        ref_pixel = ref_pixel[::-1]
+    # construct the interpolate function
+    f_wave_to_pix = intp.InterpolatedUnivariateSpline(
+            ref_wave, ref_pixel, k=3)
+
+    linelist.add_column([-1]*len(linelist), index=-1, name='pixel')
+    linelist.add_column([-1]*len(linelist), index=-1, name='i1')
+    linelist.add_column([-1]*len(linelist), index=-1, name='i2')
+    linelist.add_column([-1]*len(linelist), index=-1, name='fitid')
+
+    n = spec.size
+    pixel_lst = np.arange(n)
+
+    hwin = int(window/2)
+    
+    for iline, line in enumerate(linelist):
+        pix1 = f_wave_to_pix(line['wave_air']) + shift
+        cint1 = int(round(pix1))
+        i1, i2 = cint1 - hwin, cint1 + hwin+1
+        i1 = max(i1, 0)
+        i2 = min(i2, n-1)
+        linelist[iline]['pixel'] = cint1
+        linelist[iline]['i1'] = i1
+        linelist[iline]['i2'] = i2
+
+    m = (linelist['pixel']>0)*(linelist['pixel']<n-1)
+    linelist = linelist[m]
+
+    # resort the linelist so that the pixels are increased
+    linelist.sort('pixel')
+
+    wave_lst, species_lst = [], []
+    # fitting parameter results
+    alpha_lst, beta_lst, center_lst = [], [], []
+    A_lst, bkg_lst, std_lst, fwhm_lst, q_lst = [], [], [], [], []
+
+    # initialize line-by-line figure
+    fig_lbl_lst = []
+    nrow, ncol = 6, 7       # the number of sub-axes in every figure
+
+    count_line = 0  # fitting counter
+    for iline, line in enumerate(linelist):
+        if line['fitid'] >=0:
+            continue
+
+        i1 = line['i1']
+        i2 = line['i2']
+        # add background level
+        ydata = spec[i1:i2]
+        p0 = [ydata.min()]
+        p0.append(spec[line['pixel']]-ydata.min())
+        p0.append(3.6)
+        p0.append(3.5)
+        p0.append(line['pixel'])
+
+        lower_bounds = [-np.inf, 0,      0.5, 0.1, i1]
+        upper_bounds = [np.inf,  np.inf, 20,   20, i2]
+
+        inextline = iline + 1
+        idx_lst = [iline]
+        while(True):
+            if inextline >= len(linelist):
+                break
+            nextline = linelist[inextline]
+            next_i1 = nextline['i1']
+            next_i2 = nextline['i2']
+            if next_i1 < i2 - 3:
+                i2 = next_i2
+                ydata = spec[i1:i2]
+                # update backgroud
+                p0[0] = ydata.min()
+                p0.append(spec[nextline['pixel']] - ydata.min())
+                p0.append(3.6)
+                p0.append(3.5)
+                p0.append(nextline['pixel'])
+                lower_bounds.append(0)
+                lower_bounds.append(0.5)
+                lower_bounds.append(0.1)
+                lower_bounds.append(next_i1)
+                upper_bounds.append(np.inf)
+                upper_bounds.append(20)
+                upper_bounds.append(20)
+                upper_bounds.append(next_i2)
+                idx_lst.append(inextline)
+            else:
+                break
+
+            inextline += 1
+
+        xdata = np.arange(i1, i2)
+
+        fitres = opt.least_squares(errfunc, p0,
+                    bounds=(lower_bounds, upper_bounds),
+                    args=(xdata, ydata, fitline),
+        )
+
+        param = fitres['x']
+
+        fmt_str = (' - {:2s} {:3s} {:10.4f}: {:4d}-{:4d} '
+                   'alpha={:6.3f} beta={:6.3f} center={:8.3f} fwhm={:6.2f} '
+                   'q={:6.2f} FITID:{:3d}')
+
+        nline = int((len(param)-1)/4)
+        for i in range(nline):
+            A, alpha, beta, center = param[i*4+1:i*4+5]
+            fwhm = 2*alpha*np.power(np.log(2), 1/beta)
+            std = np.sqrt(fitres['cost']*2/xdata.size)
+            q = A/std
+
+            line = linelist[iline+i]
+            wave_lst.append(line['wave_air'])
+            species_lst.append('{} {}'.format(line['element'], line['ion']))
+            # append fitting results
+            center_lst.append(center)
+            A_lst.append(A)
+            alpha_lst.append(alpha)
+            beta_lst.append(beta)
+            fwhm_lst.append(fwhm)
+            bkg_lst.append(param[0])
+            std_lst.append(std)
+            q_lst.append(q)
+
+            print(fmt_str.format(line['element'], line['ion'], line['wave_air'],
+                    i1, i2, alpha, beta, center, fwhm, q, count_line))
+
+            linelist['i1'][idx_lst[i]] = i1
+            linelist['i2'][idx_lst[i]] = i2
+            linelist['fitid'][iline+i] = count_line
+
+
+        # plot line-by-line
+        # create figure
+        if count_line%(nrow*ncol)==0:
+            fig_lbl = plt.figure(figsize=(16, 9), dpi=150, tight_layout=True)
+            fig_lbl_lst.append(fig_lbl)
+        # create small axes
+        axs = fig_lbl.add_subplot(nrow, ncol, count_line%(nrow*ncol)+1)
+        axs.plot(xdata, ydata*1e-3, 'o', c='C0', ms=4, alpha=0.7)
+        # plot fitted curve
+        newx = np.linspace(xdata[0], xdata[-1], 100)
+        newy = fitline(param, newx)
+        axs.plot(newx, newy*1e-3, ls='-', color='C1', lw=0.7, alpha=0.7)
+
+        # draw text and plot line center as vertical lines
+        text_lst = []
+        for i in range(nline):
+            A, alpha, beta, center = param[i*4+1:i*4+5]
+            line = linelist[iline+i]
+            axs.axvline(x=center, color='k', ls='--', lw=0.7)
+            text = '{} {} {:9.4f}'.format(line['element'], line['ion'], line['wave_air'])
+            text_lst.append(text)
+        _text = '\n'.join(text_lst)
+        axs.set_xlim(newx[0], newx[-1])
+        _x1, _x2 = axs.get_xlim()
+        _y1, _y2 = axs.get_ylim()
+        _y2 = _y2 + 0.2*(_y2 - _y1)
+        axs.text(0.95*_x1+0.05*_x2, 0.05*_y1+0.95*_y2, _text,
+                 ha='left', va='top', fontsize=8)
+        axs.set_ylim(_y1, _y2)
+        if _x2 -_x1 < 25:
+            major_tick, minor_tick = 5, 1
+        else:
+            major_tick, minor_tick = 10, 1
+        axs.xaxis.set_major_locator(tck.MultipleLocator(major_tick))
+        axs.xaxis.set_minor_locator(tck.MultipleLocator(minor_tick))
+
+        for tick in axs.xaxis.get_major_ticks():
+            tick.label1.set_fontsize(7)
+        for tick in axs.yaxis.get_major_ticks():
+            tick.label1.set_fontsize(7)
+
+        count_line += 1
+
+    ###################################################
+    # fit wavelength solution
+    # resort the pixel list and wavelength list
+    wave_lst = np.array(wave_lst)
+    center_lst = np.array(center_lst)
+    A_lst = np.array(A_lst)
+    std_lst = np.array(std_lst)
+    q_lst = np.array(q_lst)
+
+    # resort the center list
+    idx = center_lst.argsort()
+    center_lst = center_lst[idx]
+    wave_lst = wave_lst[idx]
+
+    # begin wavelength solution fit
+    mask = q_lst > q_threshold
+    #mask = np.ones_like(wave_lst, dtype=bool)
+
+    for i in range(10):
+        coeff_wave = np.polyfit(center_lst[mask], wave_lst[mask],
+                                deg=deg)
+        fitwave = np.polyval(coeff_wave, center_lst)
+        reswave = wave_lst - fitwave
+        stdwave = reswave[mask].std()
+        newmask = (np.abs(reswave) < clipping*stdwave)*(q_lst>q_threshold)
+        if newmask.sum()==mask.sum():
+            break
+        mask = newmask
+
+    allwave = np.polyval(coeff_wave, pixel_lst)
+    # prepare the wavelength calibrated arc lamp spectra
+    newtable = Table([allwave, spec], names=['wavelength', 'flux'])
+
+    # prepare the identified line list
+    linelist = linelist['wave_air', 'element', 'ion', 'source',
+                        'i1', 'i2', 'fitid']
+    linelist = linelist[linelist['fitid']>=0]
+    linelist.add_column(center_lst,     index=-1, name='pixel')
+    linelist.add_column(reswave,        index=-1, name='residual')
+    linelist.add_column(np.int16(mask), index=-1, name='use')
+    linelist.add_column(A_lst,          index=-1, name='A')
+    linelist.add_column(alpha_lst,      index=-1, name='alpha')
+    linelist.add_column(beta_lst,       index=-1, name='beta')
+    linelist.add_column(bkg_lst,        index=-1, name='bkg')
+    linelist.add_column(fwhm_lst,       index=-1, name='fwhm')
+    linelist.add_column(std_lst,        index=-1, name='std')
+    linelist.add_column(q_lst,          index=-1, name='q')
+    linelist.meta.clear()
+
+    # plot wavelength solution
+    fig_sol = plt.figure(figsize=(12, 6), dpi=300)
+    axt1 = fig_sol.add_axes([0.07, 0.40, 0.44, 0.52])
+    axt2 = fig_sol.add_axes([0.07, 0.10, 0.44, 0.26])
+    axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
+    axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
+
+    axt1.plot(pixel_lst, allwave, c='k', lw=0.6, zorder=10)
+    species = np.unique(species_lst)
+    for ispecies, _species in enumerate(sorted(species)):
+        m = np.array([v==_species for v in species_lst])
+        c = 'C{}'.format(ispecies)
+        axt1.plot(center_lst[mask*m], wave_lst[mask*m], 'o',
+                  ms=4, c=c, label=_species, alpha=0.7)
+        axt1.plot(center_lst[(~mask)*m], wave_lst[(~mask)*m], 'o',
+                  ms=5, c='none', mec=c, alpha=0.7)
+        axt2.plot(center_lst[mask*m], reswave[mask*m], 'o',
+                  ms=4, c=c, alpha=0.7)
+        axt2.plot(center_lst[(~mask)*m], reswave[(~mask)*m], 'o',
+                  ms=5, c='none', mec=c, alpha=0.7)
+    axt1.legend(loc='upper center', ncols=len(species))
+
+    axt2.axhline(y=0, color='k', ls='--', lw=0.6, zorder=-1)
+    axt2.axhline(y=stdwave, color='k', ls='--', lw=0.6, zorder=-1)
+    axt2.axhline(y=-stdwave, color='k', ls='--', lw=0.6, zorder=-1)
+    for ax in fig_sol.get_axes():
+        ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
+        ax.set_axisbelow(True)
+        ax.set_xlim(0, n-1)
+    y1, y2 = axt2.get_ylim()
+    z = max(abs(y1), abs(y2))
+    z = max(z, 4*stdwave)
+    # draw a text
+    _text = u'Order = {}, N = {}, RMS = {:5.3f} \xc5'.format(
+            deg, mask.sum(), stdwave)
+    axt2.text(0.03*n, 0.85*z, _text, ha='left', va='top')
+    axt2.set_ylim(-z, z)
+    axt2.set_xlabel('Pixel')
+    axt1.set_ylabel(u'\u03bb (\xc5)')
+    axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
+    axt1.xaxis.set_major_locator(tck.MultipleLocator(200))
+    axt1.xaxis.set_minor_locator(tck.MultipleLocator(50))
+    axt2.xaxis.set_major_locator(tck.MultipleLocator(200))
+    axt2.xaxis.set_minor_locator(tck.MultipleLocator(50))
+    axt1.set_xticklabels([])
+    axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
+    axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+    axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
+    axt5.set_xlabel('Pixel')
+    axt5.set_ylabel(u'dv/dx (km/s)')
+
+    return {'wavelength': allwave,
+            'linelist': linelist,
+            'std': stdwave,
+            'fig_solution': fig_sol,
+            'fig_fitlbl': fig_lbl_lst,
+            }

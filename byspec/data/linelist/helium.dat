@@ -1,0 +1,12 @@
+#         M60: W.C.Martin, 1960, J.Res.Natl.Bur.Stand.(US), Sect. A 64, 19-28
+#              DOI:10.6028/jres.064A.003
+ wave_air element ion source
+--------- ------- --- ------
+3888.648       He   I    M60
+4471.479       He   I    M60
+4713.1455      He   I    M60
+4921.9310      He   I    M60
+5015.6779      He   I    M60
+5875.621       He   I    M60
+6678.151       He   I    M60
+7065.190       He   I    M60

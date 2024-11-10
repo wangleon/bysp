@@ -1,3 +1,3 @@
-       fileid object    obsdate ndisp     mode config slit binning gain rdnoise observer                              md5
-------------- ------ ---------- ----- -------- ------ ---- ------- ---- ------- -------- --------------------------------
-20230418c1278  FeAr  2023-04-18  2048 longslit   G4   1.8"   1x1    2.2   7.8   XingLong 2e2247a5d04d674cccfde2b53435c656 
+      fileid object  exptime             dateobs     mode config slit binning gain rdnoise    rms ntotal nused                              md5
+------------ ------ -------- ------------------- -------- ------ ---- ------- ---- ------- ------ ------ ----- --------------------------------
+202304180061   FeAr  300.000 2023-04-18T21:18:43 longslit     G4 1.8"     1x1  2.2     7.8  0.722     47    44 a3c9c49888f7717397835ac5ef65fd29

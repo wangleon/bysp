@@ -20,7 +20,8 @@ from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         get_local_minima)
 from .visual import plot_image_with_hist
 
-from .common import FOSCReducer, find_longslit_wavelength
+from .common import (FOSCReducer, find_longslit_wavelength,
+                     find_distortion)
 
 def print_wrapper(string, item):
     """A wrapper for obslog printing
@@ -521,6 +522,12 @@ def get_longslit_sensmap(data):
 
 
 class BFOSC(FOSCReducer):
+
+    # Geolocation of Xinglong 2.16m telescope
+    longitude = 117.57454167
+    latitude  = 40.395933
+    altitude  = 950.0
+    
     def __init__(self, **kwargs):
         super(BFOSC, self).__init__(**kwargs)
 
@@ -887,6 +894,8 @@ class BFOSC(FOSCReducer):
         self.lamp_spec_lst = spec_lst
 
     def ident_longslit_wavelength(self):
+        self.wave = {}
+        self.ident = {}
 
         index_file = os.path.join(os.path.dirname(__file__),
                                   'data/calib/wlcalib_bfosc.dat')
@@ -1006,275 +1015,8 @@ class BFOSC(FOSCReducer):
             hdulst.writeto('wlcalib_{}.fits'.format(fileid),
                            overwrite=True)
 
-
-    def identify_wavelength(self):
-        pixel_lst = np.arange(self.ndisp)
-
-        filename = os.path.dirname(__file__) + '/data/linelist/FeAr.dat'
-        linelist = Table.read(filename, format='ascii.fixed_width_two_line')
-        wavebound = 6907 # wavelength boundary to separate the red and blue
-
-        index_file = os.path.join(os.path.dirname(__file__),
-                                  'data/calib/wlcalib_bfosc.dat')
-        ref_spec = select_calib_from_database(index_file, self.obsdate)
-        ref_wave  = ref_spec['wavelength']
-        ref_flux  = ref_spec['flux']
-        shift_lst = np.arange(-100, 100)
-
-        def errfunc(p, x, y, fitfunc):
-            return y - fitfunc(p, x)
-        def fitline(p, x):
-            return gengaussian(p[0], p[1], p[2], p[3], x) + p[4]
-
-        self.wave_solutions = {}
-        coeff_wave_lst = []
-
-        for logitem_lst in self.calib_groups:
-            # determine blue and red calib lamp
-            q95_lst = {}
-
-            for logitem in logitem_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                q95 = np.percentile(data, 95)
-                q95_lst[logitem['fileid']] = q95
-            # sort FeAr lamps with intensity from the smallest to the largest
-            sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
-            bandselect_fileids = {
-                    'R': sorted_q95_lst[0][0], # choose the smallest as red
-                    'B': sorted_q95_lst[-1][0], # choose the largets as blue
-                    }
-            print('BLUE:', bandselect_fileids['B'])
-            print('RED:',  bandselect_fileids['R'])
-
-            # use red flux to compute ccf
-            _fileid = bandselect_fileids['R']
-            flux = self.lamp_spec_lst[_fileid]['flux']
-            ccf_lst = get_simple_ccf(flux, ref_flux, shift_lst)
-
-            #fig = plt.figure()
-            #ax = fig.gca()
-            #ax.plot(shift_lst, ccf_lst, c='C3')
-
-            pixel_corr = shift_lst[ccf_lst.argmax()]
-            print(pixel_corr)
-
-            # mosaic red and blue
-            fileid_R = bandselect_fileids['R']
-            fileid_B = bandselect_fileids['B']
-            flux_R = self.lamp_spec_lst[fileid_R]['flux']
-            flux_B = self.lamp_spec_lst[fileid_B]['flux']
-            norm_R = np.percentile(flux_R, 10)
-            norm_B = np.percentile(flux_B, 10)
-            flux_mosaic = np.zeros(self.ndisp, dtype=np.float32)
-            if ref_wave[0] > ref_wave[-1]:
-                # reverse wavelength order
-                idx = ref_wave.size - np.searchsorted(ref_wave[::-1], wavebound)
-                idx = idx + pixel_corr
-                mask = pixel_lst < idx
-            else:
-                idx = np.searchsorted(ref_wave, wavebound)
-                idx = idx + pixel_corr
-                mask = pixel_lst > idx
-            flux_mosaic[mask]  = flux_R[mask]/norm_R
-            flux_mosaic[~mask] = flux_B[~mask]/norm_B
-
-            # get new fileid
-            for _logitem in self.logtable:
-                if _logitem['fileid'] in [fileid_R, fileid_B]:
-                    dateobs = _logitem['dateobs']
-            newfileid = get_mosaic_fileid(self.obsdate, dateobs)
-
-            #fig2 = plt.figure()
-            #ax2 = fig2.gca()
-            #ax2.plot(flux_mosaic)
-            #plt.show()
-
-            wave_lst = []
-            center_lst = []
-
-            fig_lbl = plt.figure(figsize=(15, 8), dpi=150)
-            nrow, ncol = 5, 6
-            count_line = 0
-            for row in linelist:
-                linewave = row['wavelength']
-                element  = row['element']
-                ion      = row['ion']
-                if ref_wave[0]>ref_wave[-1]:
-                    # reverse wavelength order
-                    ic = self.ndisp - np.searchsorted(ref_wave[::-1], linewave)
-                else:
-                    ic = np.searchsorted(ref_wave, linewave)
-                ic = ic + pixel_corr
-                i1, i2 = ic - 9, ic + 10
-                xdata = np.arange(i1, i2)
-                ydata = flux_mosaic[xdata]
-
-                p0 = [ydata.max()-ydata.min(), 3.6, 3.5, ic, ydata.min()]
-                fitres = opt.least_squares(errfunc, p0,
-                            bounds=([-np.inf, 0.5,  0.1, i1, -np.inf],
-                                   [np.inf, 20.0, 20.0, i2, ydata.max()]),
-                            args=(xdata, ydata, fitline),
-                            )
-
-                param = fitres['x']
-                A, alpha, beta, center, bkg = param
-                center_lst.append(center)
-                wave_lst.append(linewave)
-
-                # plot
-                ix = count_line % ncol
-                iy = nrow - 1 - count_line // ncol
-                axs = fig_lbl.add_axes([0.07+ix*0.16, 0.05+iy*0.18, 0.12, 0.15])
-                color = 'C0' if linewave < wavebound else 'C3'
-                axs.scatter(xdata, ydata, s=10, alpha=0.6, color=color)
-                newx = np.linspace(i1, i2, 100)
-                newy = fitline(param, newx)
-                axs.plot(newx, newy, ls='-', color='C1', lw=1, alpha=0.7)
-                axs.axvline(x=center, color='k', ls='--', lw=0.7)
-                axs.set_xlim(newx[0], newx[-1])
-                _x1, _x2 = axs.get_xlim()
-                _y1, _y2 = axs.get_ylim()
-                _y2 = _y2 + 0.2*(_y2 - _y1)
-                _text = '{} {} {:9.4f}'.format(element, ion, linewave)
-                axs.text(0.95*_x1+0.05*_x2, 0.15*_y1+0.85*_y2, _text,
-                         fontsize=9)
-                axs.set_ylim(_y1, _y2)
-                axs.xaxis.set_major_locator(tck.MultipleLocator(5))
-                axs.xaxis.set_minor_locator(tck.MultipleLocator(1))
-                for tick in axs.yaxis.get_major_ticks():
-                    tick.label1.set_fontsize(9)
-
-            
-                count_line += 1
-            title = 'Line-by-line fitting of {}'.format(newfileid)
-            fig_lbl.suptitle(title)
-            figname = 'wavelength_ident_{}.png'.format(newfileid)
-            figfilename = os.path.join(self.figpath, figname)
-            fig_lbl.savefig(figfilename)
-            plt.close(fig_lbl)
-
-            ######
-            # fit wavelength solution
-            wave_lst = np.array(wave_lst)
-            center_lst = np.array(center_lst)
-
-            idx = center_lst.argsort()
-            center_lst = center_lst[idx]
-            wave_lst = wave_lst[idx]
-
-            coeff_wave = np.polyfit(center_lst, wave_lst, deg=5)
-            allwave = np.polyval(coeff_wave, pixel_lst)
-            fitwave = np.polyval(coeff_wave, center_lst)
-            reswave = wave_lst - fitwave
-            stdwave = reswave.std()
-            # append coeff
-            coeff_wave_lst.append(coeff_wave)
-
-            # plot wavelength solution
-            fig_sol = plt.figure(figsize=(12, 6), dpi=300)
-            axt1 = fig_sol.add_axes([0.07, 0.40, 0.44, 0.52])
-            axt2 = fig_sol.add_axes([0.07, 0.10, 0.44, 0.26])
-            axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
-            axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
-            axt1.plot(center_lst, wave_lst, 'o', ms=4)
-            axt1.plot(pixel_lst, allwave)
-            axt2.plot(center_lst, reswave, 'o', ms=4)
-            axt2.axhline(y=0, color='k', ls='--')
-            axt2.axhline(y=stdwave, color='k', ls='--', alpha=0.4)
-            axt2.axhline(y=-stdwave, color='k', ls='--', alpha=0.4)
-            for ax in fig_sol.get_axes():
-                ax.grid(True, color='k', alpha=0.4, ls='--', lw=0.5)
-                ax.set_axisbelow(True)
-                ax.set_xlim(0, self.ndisp - 1)
-            y1, y2 = axt2.get_ylim()
-            axt2.text(0.03 * self.ndisp, 0.2 * y1 + 0.8 * y2,
-                      u'RMS = {:5.3f} \xc5'.format(stdwave))
-            axt2.set_ylim(y1, y2)
-            axt2.set_xlabel('Pixel')
-            axt1.set_ylabel(u'\u03bb (\xc5)')
-            axt2.set_ylabel(u'\u0394\u03bb (\xc5)')
-            axt1.set_xticklabels([])
-            axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
-            axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
-            axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
-            axt5.set_xlabel('Pixel')
-            axt5.set_ylabel(u'dv/dx (km/s)')
-            title = 'Wavelength Solution for {}'.format(newfileid)
-            fig_sol.suptitle(title)
-            figname = 'wavelength_solution_{}.png'.format(newfileid)
-            figfilename = os.path.join(self.figpath, figname)
-            fig_sol.savefig(figfilename)
-            plt.close(fig_sol)
-
-            fig_imap = plt.figure(dpi=200)
-            ax_imap1 = fig_imap.add_subplot(211)
-            ax_imap2 = fig_imap.add_subplot(212)
-            ax_imap1.plot(allwave, flux_mosaic, lw=0.5)
-            _y1, _y2 = ax_imap1.get_ylim()
-            ax_imap1.vlines(wave_lst, _y1, _y2, color='k', lw=0.5, ls='--')
-            ax_imap1.set_ylim(_y1, _y2)
-            ax_imap2.plot(allwave, pixel_lst, lw=0.5)
-            for ax in fig_imap.get_axes():
-                ax.grid(True, ls='--', lw=0.5)
-                ax.set_axisbelow(True)
-                ax.set_xlim(allwave[0], allwave[-1])
-            ax_imap2.set_xlabel(u'Wavelength (\xc5)')
-            figname = 'wavelength_identmap_{}.png'.format(newfileid)
-            figfilename = os.path.join(self.figpath, figname)
-            fig_imap.savefig(figfilename)
-            plt.show()
-            plt.close(fig_imap)
-
-            # save wavelength calibration data
-            data = Table(dtype=[
-                ('wavelength',  np.float64),
-                ('flux',        np.float32),
-                ])
-            for _w, _f in zip(allwave, flux_mosaic):
-                data.add_row((_w, _f))
-            head = fits.Header()
-            head['OBJECT']   = 'FeAr'
-            head['TELESCOP'] = 'Xinglong 2.16m'
-            head['INSTRUME'] = 'BFOSC'
-            head['FILEID']   = newfileid
-            head['MOSAICED'] = True
-            head['NMOSAIC']  = 2
-            head['WAVEBD']   = wavebound,
-            head['FILEID1']  = fileid_B,
-            head['FILEID2']  = fileid_R,
-            head['INSTMODE'] = logitem['mode']
-            head['CONFIG']   = logitem['config']
-            head['NDISP']    = self.ndisp
-            head['SLIT']     = logitem['slit']
-            head['FILTER']   = logitem['filter']
-            head['BINNING']  = logitem['binning']
-            head['GAIN']     = logitem['gain']
-            head['RDNOISE']  = logitem['rdnoise']
-            head['OBSERVER'] = logitem['observer']
-            hdulst = fits.HDUList([
-                    fits.PrimaryHDU(header=head),
-                    fits.BinTableHDU(data=data),
-                    ])
-            fname = 'wlcalib_{}.fits'.format(newfileid)
-            filename = os.path.join(self.reduction_path, fname)
-            hdulst.writeto(filename, overwrite=True)
-
-
-            ident_list = Table(dtype=[
-                ('wavelength',  np.float64),
-                ('element',     str),
-                ('ion',         str),
-                ('pixel',       np.float32),
-                ('residual',    np.float64),
-                ('use',         int),
-                ])
-
-            self.wave_solutions[newfileid] = allwave
-
-        # determine the global wavelength coeff
-        self.wave_coeff = np.array(coeff_wave_lst).mean(axis=0)
-
+            self.wave[fileid] = allwave
+            self.ident[fileid] = linelist
 
     def plot_wlcalib(self):
         fig = plt.figure(figsize=(12,6), dpi=150)
@@ -1406,86 +1148,112 @@ class BFOSC(FOSCReducer):
             ax = fig.gca()
             ax.plot(spec, lw=0.5)
             plt.show()
-        
 
-    def extract_all_science(self):
+    def find_longslit_distortion(self):
+
+        self.distortion = {}
+
+        for logitem in self.logtable:
+            if logitem['mode']!='longslit' or logitem['datatype']!='SPECLLAMP':
+                continue
+
+            ccdconf = self.get_ccdconf(logitem)
+            conf = self.get_conf(logitem)
+
+            fileid = logitem['fileid']
+            filename = self.fileid_to_filename(fileid)
+            data = fits.getdata(filename)
+            data = data - self.bias[ccdconf]
+            data = data / self.sensmap[conf]
+
+            allwave = self.wave[fileid]
+            linelist = self.ident[fileid]
+
+            distortion = find_distortion(data, hwidth=5, disp_axis='x',
+                                         linelist=linelist,
+                                         deg=5, xorder=3, yorder=3)
+
+            fig = distortion.plot(times=10)
+            newdata = distortion.correct_image(data)
+
+            #fig = plt.figure()
+            #ax1 = fig.add_subplot(121)
+            #ax2 = fig.add_subplot(122)
+            #ax1.imshow(data)
+            #ax2.imshow(newdata)
+
+            #fig2 = plt.figure()
+            #ax1 = fig2.add_subplot(121)
+            #ax2 = fig2.add_subplot(122)
+            #for y in np.arange(0, newdata.shape[0], 100):
+            #    ax1.plot(data[y, :]+y*10, lw=0.5)
+            #    ax2.plot(newdata[y, :]+y*10, lw=0.5)
+            #plt.show()
+            self.distortion[conf] = distortion
+
+    def extract_longslit_targets(self):
         func = lambda item: item['datatype']=='SPECLTARGET'
         logitem_lst = list(filter(func, self.logtable))
         for logitem in logitem_lst:
             self.extract(logitem)
 
+    def extract(self, logitem):
 
-    def extract(self, arg):
+        plot_opt_columns = False    # column-by-column figure of optimal extraction
 
-        if isinstance(arg, int):
-            if arg > 19000000:
-                func = lambda item: item['datatype']=='SPECLTARGET' \
-                            and item['fileid']==arg
-                logitem_lst = list(filter(func, self.logtable))
-            else:
-                func = lambda item: item['datatype']=='SPECLTARGET' \
-                            and item['frameid']==arg
-                logitem_lst = list(filter(func, self.logtable))
-
-            if len(logitem_lst)==0:
-                print('unknown fileid: {}'.format(arg))
-                return None
-            elif len(logitem_lst)>1:
-                print('Multiple items found for {}'.format(arg))
-                return None
-            else:
-                logitem = logitem_lst[0]
-        elif isinstance(arg, str):
-
-            func = lambda item: item['datatype']=='SPECLTARGET' \
-                        and item['object'].lower()==arg.strip().lower()
-            logitem_lst = list(filter(func, self.logtable))
-
-            if len(logitem_lst)==0:
-                print('unknown object name: {}'.format(arg))
-                return None
-            elif len(logitem_lst)>1:
-                print('Multiple items found for {}'.format(arg))
-                return None
-            else:
-                logitem = logitem_lst[0]
-
-        elif isinstance(arg, Row):
-            logitem = arg
-        else:
-            print('Unkown target: {}'.format(arg_))
-            return None
+        ccdconf = self.get_ccdconf(logitem)
+        conf = self.get_conf(logitem)
 
         fileid  = logitem['fileid']
-        objname = logitem['object']
+        ccd_gain = logitem['gain']
+        ccd_ron  = logitem['rdnoise']
+        filename = self.fileid_to_filename(fileid)
+        data, head = fits.getdata(filename, header=True)
+        data = data - self.bias[ccdconf]
+        data = data / self.sensmap[conf]
+
+        distortion = self.distortion[conf]
+        data = distortion.correct_image(data)
 
         print('* FileID: {} - 1d spectra extraction'.format(fileid))
-        filename = self.fileid_to_filename(fileid)
-        data = fits.getdata(filename)
-
-        data = data - self.bias_data
-        data = data / self.sens_data
 
         ny, nx = data.shape
         allx = np.arange(nx)
         ally = np.arange(ny)
-        xdata = ally
 
+        ymax = data[:, 30:250].mean(axis=1).argmax()
+        result = trace_target(data, ymax, xstep=50, polyorder=3)
+        coeff_loc, fwhm_mean, profile_func, tracefig = result[:]
+
+        # set and save figures
         figname = 'trace_{}.png'.format(fileid)
-        figfilename = os.path.join(self.figpath, figname)
-        title = 'Trace for {} ({})'.format(fileid, objname)
-        coeff_loc, fwhm_mean, profile_func = find_order_location(
-                                                data, figfilename, title)
+        figfilename = os.path.join('./', figname)
+        title = 'Trace for {} ({})'.format(fileid, logitem['object'])
+        tracefig.suptitle(title)
+        tracefig.savefig(figfilename)
+        plt.close(tracefig)
 
-        # generate order location array
-        ycen = np.polyval(coeff_loc, allx)
-     
-        # generate wavelength list considering horizontal shift
-        xshift_lst = np.polyval(self.curve_coeff, ycen)
-        wave_lst = np.polyval(self.wave_coeff, allx - xshift_lst)
-     
+        # find closet wavelength calibration 
+        mid_time = dateutil.parser.parse(logitem['dateobs']) + \
+                datetime.timedelta(seconds=logitem['exptime']/2)
+
+
+        timediff_lst = []
+        calibfileid_lst = []
+        for _fileid in self.wave.keys():
+            _logitem = self.logtable[self.logtable['fileid']==_fileid][0]
+            calib_midtime = dateutil.parser.parse(_logitem['dateobs']) + \
+                    datetime.timedelta(seconds=_logitem['exptime']/2)
+            timediff = mid_time - calib_midtime
+            timediff_lst.append(timediff)
+            calibfileid_lst.append(_fileid)
+        argmin = np.argmin(timediff_lst)
+        calib_fileid = calibfileid_lst[argmin]
+
+        wave = self.wave[calib_fileid].copy()
+
         # extract 1d sepectra
-     
+        ycen = np.polyval(coeff_loc, allx) 
         # summ extraction
         yy, xx = np.mgrid[:ny, :nx]
         upper_line = ycen + fwhm_mean
@@ -1501,15 +1269,6 @@ class BFOSC(FOSCReducer):
         # extract
         spec_sum = (data * mask).sum(axis=0)
         nslit = mask.sum(axis=0)
-
-        # correct image distortion
-        ycen0 = ycen[0:-200].mean()
-        cdata = np.zeros_like(data, dtype=data.dtype)
-        for y in np.arange(ny):
-            row = data[y, :]
-            shift = np.polyval(self.curve_coeff, y) - np.polyval(self.curve_coeff, ycen0)
-            f = intp.InterpolatedUnivariateSpline(allx, row, k=3, ext=3)
-            cdata[y, :] = f(allx + shift)
 
         # initialize background mask
         bkgmask = np.zeros_like(data, dtype=bool)
@@ -1532,7 +1291,7 @@ class BFOSC(FOSCReducer):
      
         # method 2
         for r1, r2 in background_rows:
-            cutdata = cdata[r1:r2, :]
+            cutdata = data[r1:r2, :]
             mean = cutdata.mean(axis=0)
             std = cutdata.std()
             mask = (cutdata < mean + 3 * std) * (cutdata > mean - 3 * std)
@@ -1559,7 +1318,7 @@ class BFOSC(FOSCReducer):
         posmask = np.nonzero(bkgmasksum)[0]
         # initialize crossspec
         crossspec = np.zeros(ny)
-        crossspec[posmask] = (cdata * bkgmask).sum(axis=1)[posmask] / bkgmasksum[posmask]
+        crossspec[posmask] = (data * bkgmask).sum(axis=1)[posmask] / bkgmasksum[posmask]
         fitx = ally[posmask]
         fity = crossspec[posmask]
         fitmask = np.ones_like(posmask, dtype=bool)
@@ -1578,50 +1337,50 @@ class BFOSC(FOSCReducer):
             bkgmask[y, :] = False
      
         # plot the cross-section of background regions
-        fig100 = plt.figure(figsize=(9, 6), dpi=100)
-        ax1 = fig100.add_axes([0.07, 0.54, 0.87, 0.36])
-        ax2 = fig100.add_axes([0.07, 0.12, 0.87, 0.36])
+        figbkg = plt.figure(figsize=(9, 6), dpi=200)
+        ax1 = figbkg.add_axes([0.07, 0.54, 0.87, 0.36])
+        ax2 = figbkg.add_axes([0.07, 0.12, 0.87, 0.36])
         newy = np.polyval(c, ally)
-        for ax in fig100.get_axes():
-            ax.plot(ally, cdata.mean(axis=1), alpha=0.3, color='C0', lw=0.7)
+        for ax in figbkg.get_axes():
+            ax.plot(ally, data.mean(axis=1), alpha=0.3, color='C0', lw=0.7)
         y1, y2 = ax1.get_ylim()
      
         ylst = ally[posmask][fitmask]
         for idxlst in np.split(ylst, np.where(np.diff(ylst) != 1)[0] + 1):
-            for ax in fig100.get_axes():
+            for ax in figbkg.get_axes():
                 ax.plot(ally[idxlst], crossspec[idxlst], color='C0', lw=0.7)
                 ax.fill_betweenx([y1, y2], idxlst[0], idxlst[-1],
                                  facecolor='C2', alpha=0.15)
      
-        for ax in fig100.get_axes():
+        for ax in figbkg.get_axes():
             ax.plot(ally, newy, color='C1', ls='-', lw=0.5)
      
         ax2.plot(ally, newy + std, color='C1', ls='--', lw=0.5)
         ax2.plot(ally, newy - std, color='C1', ls='--', lw=0.5)
-        for ax in fig100.get_axes():
+        for ax in figbkg.get_axes():
             ax.set_xlim(0, ny - 1)
             ax.grid(True, ls='--', lw=0.5)
             ax.set_axisbelow(True)
         ax1.set_ylim(y1, y2)
         ax2.set_ylim(newy.min() - 6 * std, newy.max() + 6 * std)
         ax2.set_xlabel('Y (pixel)')
-        title = '{} ({})'.format(fileid, objname)
-        fig100.suptitle(title)
+        title = '{} ({})'.format(fileid, logitem['object'])
+        figbkg.suptitle(title)
         figname = 'bkg_cross_{}.png'.format(fileid)
-        figfilename = os.path.join(self.figpath, figname)
-        fig100.savefig(figfilename)
-        plt.close(fig100)
+        figfilename = os.path.join('./', figname)
+        figbkg.savefig(figfilename)
+        plt.close(figbkg)
      
         # plot a 2d image of distortion corrected image
         # and background region
-        fig3 = plt.figure(dpi=100, figsize=(12, 6))
+        fig3 = plt.figure(dpi=200, figsize=(12, 6))
         ax31 = fig3.add_axes([0.07, 0.1, 0.4, 0.8])
         ax32 = fig3.add_axes([0.55, 0.1, 0.4, 0.8])
-        vmin = np.percentile(cdata, 10)
-        vmax = np.percentile(cdata, 99)
-        ax31.imshow(cdata, origin='lower', vmin=vmin, vmax=vmax)
-        bkgdata = np.zeros_like(cdata, dtype=cdata.dtype)
-        bkgdata[bkgmask] = cdata[bkgmask]
+        vmin = np.percentile(data, 10)
+        vmax = np.percentile(data, 99)
+        ax31.imshow(data, origin='lower', vmin=vmin, vmax=vmax)
+        bkgdata = np.zeros_like(data, dtype=data.dtype)
+        bkgdata[bkgmask] = data[bkgmask]
         bkgdata[~bkgmask] = (vmin + vmax) / 2
         ax32.imshow(bkgdata, origin='lower', vmin=vmin, vmax=vmax)
         for ax in fig3.get_axes():
@@ -1629,25 +1388,163 @@ class BFOSC(FOSCReducer):
             ax.set_ylim(0, ny - 1)
             ax.set_xlabel('X (pixel)')
             ax.set_ylabel('Y (pixel)')
-        title = '{} ({})'.format(fileid, objname)
+        title = '{} ({})'.format(fileid, logitem['object'])
         fig3.suptitle(title)
         figname = 'bkg_region_{}.png'.format(fileid)
-        figfilename = os.path.join(self.figpath, figname)
+        figfilename = os.path.join('./', figname)
         fig3.savefig(figfilename)
         plt.close(fig3)
      
         # background spectra per pixel along spatial direction
-        bkgspec = (cdata * bkgmask).sum(axis=0) / (bkgmask.sum(axis=0))
+        bkgspec = (data * bkgmask).sum(axis=0) / (bkgmask.sum(axis=0))
         # background spectra in the spectrum aperture
         background_sum = bkgspec * nslit
      
         spec_sum_dbkg = spec_sum - background_sum
 
+        ####### optimal extraction ##########
+        debkg_data = data - np.repeat([bkgspec], ny, axis=0)
 
-def find_order_location(data, figfilename, title):
+        fitprof_func = lambda p, x: p[0] * profile_func(x) + p[1]
+        f_opt_lst = []
+        b_opt_lst = []
+        for x in np.arange(nx):
+            ycenint = np.int32(np.round(ycen[x]))
+            y1 = ycenint - 18
+            y2 = ycenint + 19
+            fitx = ally[y1:y2] - ycenint
+            flux = data[y1:y2, x]
+            debkg_flux = debkg_data[y1:y2, x]
+            mask = np.ones(y2 - y1, dtype=bool)
 
-    def errfunc(p, x, y, fitfunc):
-        return y - fitfunc(p, x)
+            # b0 = (flux[0]+flux[-1])/2
+            b0 = bkgspec[x]
+            p0 = [flux.max() - b0, b0]
+            maxiter = 6
+            for ite in range(maxiter):
+                fitres = opt.least_squares(errfunc, p0,
+                                args=(fitx[mask], flux[mask], fitprof_func))
+                p = fitres['x']
+                res_lst = errfunc(p, fitx, flux, fitprof_func)
+                std = res_lst[mask].std()
+                new_mask = res_lst < 3 * std
+                if new_mask.sum() == mask.sum():
+                    break
+                mask = new_mask
+
+            # plot the column-by-column fitting figure
+            if plot_opt_columns:
+                nrow = 5
+                ncol = 7
+                if x % (nrow * ncol) == 0:
+                    fig = plt.figure(figsize=(14, 8), dpi=200)
+                iax = x % (nrow * ncol)
+                icol = iax % ncol
+                irow = int(iax / ncol)
+                w1 = 0.95 / ncol
+                w2 = w1 - 0.025
+                h1 = 0.96 / nrow
+                h2 = h1 - 0.025
+                ax = fig.add_axes([0.05 + icol * w1, 0.05 + (nrow - irow - 1) * h1, w2, h2])
+                ax.scatter(fitx, flux, c='w', edgecolor='C0', s=15)
+                ax.scatter(fitx[mask], flux[mask], c='C0', s=15)
+                newx = np.arange(y1, y2 + 1e-3, 0.1) - ycenint
+                newy = fitprof_func(p, newx)
+                ax.plot(newx, newy, ls='-', color='C1')
+                ax.plot(newx, newy + std, ls='--', color='C1')
+                ax.plot(newx, newy - std, ls='--', color='C1')
+                ylim1, ylim2 = ax.get_ylim()
+                ax.text(0.95 * fitx[0] + 0.05 * fitx[-1], 0.1 * ylim1 + 0.9 * ylim2,
+                        'X = {:4d}'.format(x))
+                ax.axvline(x=0, c='k', ls='--', lw=0.5)
+                ax.set_ylim(ylim1, ylim2)
+                ax.set_xlim(fitx[0], fitx[-1])
+                if iax == (nrow * ncol - 1) or x == nx - 1:
+                    figname = 'fit_{}_{:04d}.png'.format(fileid, x)
+                    if not os.path.exists('debug'):
+                        os.mkdir('debug')
+                    figfilename = os.path.join('debug', figname)
+                    fig.savefig(figfilename)
+                    plt.close(fig)
+
+            # variance array
+            s_lst = 1 / (np.maximum(flux * ccd_gain, 0) + ccd_ron ** 2)
+            profile = profile_func(fitx)
+            normpro = profile / profile.sum()
+            fopt = ((s_lst * normpro * debkg_flux)[mask].sum()) / \
+                   ((s_lst * normpro ** 2)[mask].sum())
+  
+            bkg_flux = np.repeat(bkgspec[x], y2 - y1)
+            bopt = ((s_lst * normpro * bkg_flux)[mask].sum()) / \
+                   ((s_lst * normpro ** 2)[mask].sum())
+            f_opt_lst.append(fopt)
+            b_opt_lst.append(bopt)
+        f_opt_lst = np.array(f_opt_lst)
+        b_opt_lst = np.array(b_opt_lst)
+  
+        spec_opt_dbkg = f_opt_lst
+        background_opt = b_opt_lst
+        spec_opt = spec_opt_dbkg + background_opt
+  
+        # now:
+        #                      |      sum       |    optimal
+        # ---------------------+----------------+----------------
+        # backgroud:           | background_sum | background_opt
+        # target + background: | spec_sum       | spec_opt
+        # target:              | spec_sum_dbkg  | spec_opt_dbkg
+
+        # save 1d spectra to ascii files
+
+        if wave[0] > wave[-1]:
+            # reverse spectrum
+            wave = wave[::-1]
+            spec_sum       = spec_sum[::-1]
+            spec_opt       = spec_opt[::-1]
+            spec_opt_dbkg  = spec_opt_dbkg[::-1]
+            spec_sum_dbkg  = spec_sum_dbkg[::-1]
+            background_opt = background_opt[::-1]
+            background_sum = background_sum[::-1]
+
+        types = [
+                ('wavelength',      np.float64),
+                ('flux_opt',        np.float32),
+                ('background_opt',  np.float32),
+                ('flux_sum',        np.float32),
+                ('background_sum',  np.float32),
+                ]
+        names, formats=list(zip(*types))
+        spectype = np.dtype({'names': names, 'formats': formats})
+
+        data = []
+        for w, f1, b1, f2, b2 in zip(wave, spec_opt_dbkg, background_opt,
+                                           spec_sum_dbkg, background_sum):
+            data.append((w, f1, b1, f2, b2))
+        data = np.array(data, dtype=spectype)
+
+
+        # prepare header
+        mid_time_utc = mid_time - datetime.timedelta(hours=8)
+        head['HIERARCH BYSPEC MIDTIME'] = mid_time_utc.isoformat()
+        # calculate barycentric velocity correction
+        barycorr = self.get_barycorr(logitem['RAJ2000'], logitem['DEJ2000'],
+                                     mid_time_utc)
+        head['HIERARCH BYSPEC BARYCORR'] = barycorr
+
+        fname = 'spec_{}.fits'.format(fileid)
+        oned_path = 'onedspec'
+        if not os.path.exists(oned_path):
+            os.mkdir(oned_path)
+        filename = os.path.join(oned_path, fname)
+        hdulst = fits.HDUList([fits.PrimaryHDU(header=head),
+                               fits.BinTableHDU(data=data),
+                               ])
+        hdulst.writeto(filename, overwrite=True)
+
+def errfunc(p, x, y, fitfunc):
+    return y - fitfunc(p, x)
+
+def trace_target(data, ypos, xstep, polyorder):
+
 
     def fitfunc(p, x):
         return gaussian(p[0], p[1], p[2], x)+p[3]
@@ -1656,33 +1553,27 @@ def find_order_location(data, figfilename, title):
     ny, nx = data.shape
     allx = np.arange(nx)
     ally = np.arange(ny)
-    ymax = data[:,30:250].mean(axis=1).argmax()
-    #print(ymax)
-    xscan_lst = []
-    ycen_lst = []
-    fwhm_lst = []
 
-    xnode_lst = []
-    ynode_lst = []
+    xscan_lst, ycen_lst, fwhm_lst = [], [], []
+    xnode_lst, ynode_lst = [], []
 
     # make a plot
-    fig1 = plt.figure(figsize=(12, 8), dpi=100)
+    fig1 = plt.figure(figsize=(12, 8), dpi=200)
     w1 = 0.39
     ax1 = fig1.add_axes([0.07, 0.43, 0.39, 0.50])
     ax2 = fig1.add_axes([0.56, 0.07, w1, 0.22])
     ax3 = fig1.add_axes([0.07, 0.07, 0.39, 0.30])
-    ax4 = fig1.add_axes([0.56, 0.35, w1, w1 / 2 * 3])
+    ax4 = fig1.add_axes([0.56, 0.35, w1, w1/2*3])
     offset_mark = 0
-    yc = ymax
-    for ix, x in enumerate(np.arange(30, nx-200, 50)):
+    yc = ypos
+    for ix, x in enumerate(np.arange(30, nx-200, xstep)):
         xdata = ally
         # ydata = data[:,x]
-        ydata = data[:, x - 20:x + 21].mean(axis=1)
+        ydata = data[:, x-20:x+21].mean(axis=1)
         y1 = yc - 20
         y2 = yc + 20
         yc = ydata[y1:y2].argmax() + y1
         succ = True
-
 
         for i in range(2):
             y1 = yc - 20
@@ -1696,8 +1587,7 @@ def find_order_location(data, figfilename, title):
                 fitres = opt.least_squares(errfunc, p0,
                             bounds=([0,      3,  -np.inf, -np.inf],
                                     [np.inf, 50, np.inf,  np.inf]),
-                            args=(xfitdata[mask], yfitdata[mask],
-                                                 fitfunc))
+                            args=(xfitdata[mask], yfitdata[mask], fitfunc))
                 p = fitres['x']
                 res_lst = errfunc(p, xfitdata, yfitdata, fitfunc)
                 std = res_lst[mask].std()
@@ -1705,7 +1595,7 @@ def find_order_location(data, figfilename, title):
                 mask = new_mask
 
             A, fwhm, center, bkg = p
-            if A < 0 or fwhm > 100:
+            if A < 0 or fwhm > 100 or fwhm < 1:
                 succ = False
                 break
             yc = int(round(center))
@@ -1729,14 +1619,14 @@ def find_order_location(data, figfilename, title):
             offset_mark = 1
         offset = x * offset_rate
 
-        color = 'C{:d}'.format(ix % 10)
-        ax1.scatter(xfitdata, yfitdata - bkg + offset,
+        color = 'C{:d}'.format(ix%10)
+        ax1.scatter(xfitdata, yfitdata-bkg+offset,
                     alpha=0.5, s=4, c=color)
-        ax1.plot(newx, newy - bkg + offset,
+        ax1.plot(newx, newy-bkg+offset,
                  alpha=0.5, lw=0.5, color=color)
-        ax1.vlines(center, offset, A + offset,
+        ax1.vlines(center, offset, A+offset,
                    color=color, lw=0.5, alpha=0.5)
-        ax1.hlines(offset, center - fwhm, center + fwhm,
+        ax1.hlines(offset, center-fwhm, center+fwhm,
                    color=color, lw=0.5, alpha=0.5)
 
         # plot stacked profiles in ax3
@@ -1754,11 +1644,13 @@ def find_order_location(data, figfilename, title):
 
     # fit the order position with iterative polynomial
     mask = np.ones_like(xscan_lst, dtype=bool)
-    for i in range(2):
-        coeff_loc = np.polyfit(xscan_lst[mask], ycen_lst[mask], deg=3)
+    for i in range(3):
+        coeff_loc = np.polyfit(xscan_lst[mask], ycen_lst[mask], deg=polyorder)
         res_lst = ycen_lst - np.polyval(coeff_loc, xscan_lst)
         std = res_lst[mask].std()
         new_mask = (res_lst < 3 * std) * (res_lst > -3 * std)
+        if new_mask.sum()==mask.sum():
+            break
         mask = new_mask
 
     # final position
@@ -1837,25 +1729,5 @@ def find_order_location(data, figfilename, title):
     ax4.plot(allx, ycen, ls='-', color='C3', lw=0.5, alpha=1)
     ax4.plot(allx, ycen + fwhm_mean, ls='--', color='C3', lw=0.5, alpha=1)
     ax4.plot(allx, ycen - fwhm_mean, ls='--', color='C3', lw=0.5, alpha=1)
-    # set title
-    fig1.suptitle(title)
-    fig1.savefig(figfilename)
-    plt.close(fig1)
 
-    return coeff_loc, fwhm_mean, interf
-
-
-def group_caliblamps(lamp_item_lst):
-    frameid_lst = [_logitem['frameid'] for _logitem in lamp_item_lst]
-
-    logitem_groups = []
-    for group in consecutive(frameid_lst):
-        logitem_lst = []
-        for frameid in group:
-            for _logitem in lamp_item_lst:
-                if _logitem['frameid']==frameid:
-                    logitem_lst.append(_logitem)
-                    break
-        logitem_groups.append(logitem_lst)
-    return logitem_groups
-
+    return coeff_loc, fwhm_mean, interf, fig1

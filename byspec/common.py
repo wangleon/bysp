@@ -1,6 +1,9 @@
 import os
 import numpy as np
 from astropy.table import Table
+from astropy.time import Time
+from astropy.coordinates import SkyCoord, EarthLocation
+import astropy.units as u
 import scipy.optimize as opt
 import scipy.interpolate as intp
 import matplotlib.pyplot as plt
@@ -106,26 +109,140 @@ class FOSCReducer(object):
                 fits.writeto(flat_filename, flat_data, ovewrite=True)
                 self.flat_data[_conf] = flat_data
 
+    def find_logitem(self, arg):
+
+        item_lst = [logitem for logitem in self.logtable if
+                            logitem['frameid']==arg or \
+                            logitem['fileid']==arg or \
+                            logitem['object']==arg]
+        return item_lst
+
+    def get_barycorr(self, ra, dec, obstime):
+        loc = EarthLocation.from_geodetic(
+                lat     = self.latitude*u.deg,
+                lon     = self.longitude*u.deg,
+                height  = self.altitude*u.m,
+                )
+        coord = SkyCoord(ra, dec, unit=(u.hourangle, u.deg))
+        barycorr = coord.radial_velocity_correction(
+                    kind = 'barycentric',
+                    obstime=Time(obstime),
+                    location=loc)
+        return barycorr.to(u.km/u.s).to_value()
 
 class Distortion(object):
 
-    def __init__(self, coeff, nx, ny, disp_axis):
+    def __init__(self, coeff, nx, ny, axis):
         self.coeff = coeff
         self.nx = nx
         self.ny = ny
-        self.disp_axis = disp_axis
+        if axis in ['x', 'y']:
+            self.axis = axis
+        else:
+            raise ValueError
         
+    def plot(self, nx=10, ny=10, times=1,
+             linestyles=['--', '-'], linewidths=0.5, colors='k'):
 
-def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
-                    xorder, yorder):
+        # set line styles
+        if isinstance(linestyles, list) or isinstance(linestyles, tuple):
+            ls1, ls2 = linestyles[0], linestyles[1]
+        else:
+            ls1, ls2 = linestyles, linestyles
+
+        # set line widths
+        if isinstance(linewidths, list) or isinstance(linewidths, tuple):
+            lw1, lw2 = linewidths[0], linewidths[1]
+        else:
+            lw1, lw2 = linewidths, linewidths
+
+        # set line colors
+        if isinstance(colors, list) or isinstance(colors, tuple):
+            c1, c2 = colors[0], colors[1]
+        else:
+            c1, c2 = colors, colors
+
+        # plot the distortion curve
+        fig = plt.figure(dpi=150)
+        ax = fig.gca()
+        #ax.imshow(np.log10(data), cmap='gray')
+
+        # plot the vertical lines
+        for x in np.linspace(0, self.nx-1, nx):
+            y_lst = np.linspace(0, self.ny-1, 100)
+            x_lst = np.repeat(x, y_lst.size)
+            dc_lst = polyval2d(self.coeff, x_lst/self.nx, y_lst/self.ny)
+
+            ax.plot(x_lst, y_lst, ls=ls1, c=c1, lw=lw1)
+
+            if self.axis=='x':
+                x_lst += dc_lst*times
+            else:
+                y_lst += dc_lst*times
+
+            ax.plot(x_lst, y_lst, ls=ls2, c=c2, lw=lw2)
+
+        # plot the horizontal lines
+        for y in np.linspace(0, self.ny-1, ny):
+            x_lst = np.linspace(0, self.nx-1, 100)
+            y_lst = np.repeat(y, x_lst.size)
+            dc_lst = polyval2d(self.coeff, x_lst/self.nx, y_lst/self.ny)
+
+            ax.plot(x_lst, y_lst, ls=ls1, c=c1, lw=lw1)
+
+            if self.axis=='x':
+                x_lst += dc_lst*times
+            else:
+                y_lst += dc_lst*times
+
+            ax.plot(x_lst, y_lst, ls=ls2, c=c2, lw=lw2)
+
+        return fig
+
+    def correct_image(self, data):
+        ny, nx = data.shape
+        if nx != self.nx or ny != self.ny:
+            print('Image shape and distortion data mismatch')
+            return None
+    
+        newdata = np.zeros_like(data)
+        allx = np.arange(nx)
+        ally = np.arange(ny)
+    
+        yy, xx = np.mgrid[:ny:, :nx:]
+        dc = polyval2d(self.coeff, xx/nx, yy/ny)
+
+        if self.axis == 'x':
+            for y in np.arange(ny):
+                dc_lst = dc[y, :]
+                flux = data[y, :]
+                func = intp.InterpolatedUnivariateSpline(
+                        allx-dc_lst, flux, k=3, ext=1)
+                newdata[y, :] = func(allx)
+        elif self.axis == 'y':
+            for x in np.arange(nx):
+                dc_lst = dc[:, x]
+                flux = data[:, x]
+                func = intp.InterpolatedUnivariateSpline(
+                        ally-dc_lst, flux, k=3, ext=1)
+                newdata[:, x] = func(ally)
+        else:
+            raise ValueError
+    
+        return newdata
+
+def find_distortion(data, hwidth, disp_axis, linelist, deg,
+                    xorder, yorder, verbose=False):
 
     if disp_axis == 'x':
         data = data.T
+        transpose = True
     elif disp_axis == 'y':
-        pass
+        transpose = False
     else:
         raise ValueError
 
+    # define the line fitting function and error function
     def errfunc(p, x, y, fitfunc):
         return y - fitfunc(p, x)
     def fitline(p, x):
@@ -139,6 +256,7 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
     ny, nx = data.shape
     allx = np.arange(nx)
     ally = np.arange(ny)
+    # now Y is the dispersion direction
 
     # get the central spectra as reference
     spec0 = data[:, nx//2-hwidth:nx//2+hwidth].mean(axis=1)
@@ -222,13 +340,17 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
                     mask = False
                 else:
                     mask = True
-                print(x, '{:2d}'.format(count_line),
-                      '{:5.2f}'.format(center-i1),
-                      '{:5.2f}'.format(i2-center),
-                      '{:6.3f}'.format(alpha),
-                      '{:6.3f}'.format(beta),
-                      '{:7.2f}'.format(center), mask,
-                      A/std)
+                if verbose:
+                    print(' - Col {:4d}'.format(x),
+                          '{:4d}'.format(count_line),
+                          '{:6.2f}'.format(center-i1),
+                          '{:6.2f}'.format(i2-center),
+                          ' alpha={:6.3f},'.format(alpha),
+                          ' beta={:6.3f},'.format(beta),
+                          ' c={:7.2f},'.format(center),
+                          ' q={:6.2f}'.format(A/std),
+                          int(mask),
+                          )
 
                 m_lst.append(mask)
                 y_lst.append(center)
@@ -253,11 +375,6 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
         # initialize the mask
         m = m_lst.copy()
 
-        # plot the wavelength solution column-by-column
-        figsol = plt.figure(dpi=200)
-        axs1 = figsol.add_subplot(211)
-        axs2 = figsol.add_subplot(212)
-
         for i in range(10):
             coeff = np.polyfit(y_lst[m], w_lst[m], deg=deg)
             allw = np.polyval(coeff, ally)
@@ -268,19 +385,24 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
                 break
             else:
                 m = newm
-        axs1.plot(y_lst[m], w_lst[m], 'o', c='C0', alpha=0.8)
-        axs1.plot(y_lst[~m], w_lst[~m], 'o', c='none', mec='C0')
-        axs1.plot(ally, np.polyval(coeff, ally), '-', lw=0.5)
-        axs2.plot(y_lst[m], res_lst[m], 'o', alpha=0.8)
-        axs2.plot(y_lst[~m], res_lst[~m], 'o', c='none', mec='C0')
-        axs1.set_xlim(0, ny-1)
-        axs2.set_xlim(0, ny-1)
-        axs2.axhline(0, c='k', ls='-', lw=0.5)
-        axs2.axhline(std, c='k', ls='--', lw=0.5)
-        axs2.axhline(-std, c='k', ls='--', lw=0.5)
-        axs2.set_ylim(-6*std, 6*std)
-        figsol.savefig('sol_{:04d}.png'.format(x))
-        plt.close(figsol)
+
+        ## plot the wavelength solution column-by-column
+        #figsol = plt.figure(dpi=200)
+        #axs1 = figsol.add_subplot(211)
+        #axs2 = figsol.add_subplot(212)
+        #axs1.plot(y_lst[m], w_lst[m], 'o', c='C0', alpha=0.8)
+        #axs1.plot(y_lst[~m], w_lst[~m], 'o', c='none', mec='C0')
+        #axs1.plot(ally, np.polyval(coeff, ally), '-', lw=0.5)
+        #axs2.plot(y_lst[m], res_lst[m], 'o', alpha=0.8)
+        #axs2.plot(y_lst[~m], res_lst[~m], 'o', c='none', mec='C0')
+        #axs1.set_xlim(0, ny-1)
+        #axs2.set_xlim(0, ny-1)
+        #axs2.axhline(0, c='k', ls='-', lw=0.5)
+        #axs2.axhline(std, c='k', ls='--', lw=0.5)
+        #axs2.axhline(-std, c='k', ls='--', lw=0.5)
+        #axs2.set_ylim(-6*std, 6*std)
+        #figsol.savefig('sol_{:04d}.png'.format(x))
+        #plt.close(figsol)
 
         for y, w, dc in zip(y_lst[m], w_lst[m], dc_lst[m]):
             all_x_lst.append(x)
@@ -293,15 +415,9 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
     all_w_lst = np.array(all_w_lst)
     all_dc_lst = np.array(all_dc_lst)
 
-    # plot the 3d fitting
-    fig = plt.figure()
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax2 = fig.add_subplot(122, projection='3d')
-    #ax1.scatter(all_x_lst, all_y_lst, all_dc_lst)
-    #ax2.scatter(all_x_lst, all_y_lst, all_w_lst)
-
+    # fit the distortion coefficients
     m = np.ones_like(all_x_lst, dtype=bool)
-    for i in range(3):
+    for i in range(5):
         coeff = polyfit2d(all_x_lst[m]/nx, all_y_lst[m]/ny, all_dc_lst[m],
                       xorder=xorder, yorder=yorder)
         res_lst = all_dc_lst - polyval2d(coeff, all_x_lst/nx, all_y_lst/ny)
@@ -312,23 +428,33 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
         else:
             m = newm
 
+    if transpose:
+        # exchange the x and y axies
+        coeff = coeff.T
+        nx, ny = ny, nx
+        all_x_lst, all_y_lst = all_y_lst, all_x_lst
+
+
+    # plot the 3d fitting
+    fig3d = plt.figure(dpi=200)
+    ax1 = fig3d.add_subplot(projection='3d')
     ax1.scatter(all_x_lst[m], all_y_lst[m], all_dc_lst[m], c='C0')
     ax1.scatter(all_x_lst[~m], all_y_lst[~m], all_dc_lst[~m], c='C3')
-    ax2.scatter(all_x_lst[m], all_y_lst[m], all_w_lst[m], c='C0')
-    ax2.scatter(all_x_lst[~m], all_y_lst[~m], all_w_lst[~m], c='C0')
-
-    # plot the surface
+    # plot the 3d surface
     yy, xx = np.mgrid[:ny:, :nx:]
     zz = polyval2d(coeff, xx/nx, yy/ny)
     ax1.plot_surface(xx, yy, zz, lw=0.5, alpha=0.5)
+    ax1.set_xlabel('X (pixel)')
+    ax1.set_ylabel('Y (pixel)')
     
+    # plot the 2D figure
     fig1 = plt.figure(dpi=150, figsize=(16,9))
-    ax0 = fig1.add_axes([0.08, 0.1, 0.4, 0.8])
-    ax1 = fig1.add_axes([0.6, 0.6, 0.35, 0.31])
-    ax2 = fig1.add_axes([0.6, 0.1, 0.35, 0.31])
+    ax0 = fig1.add_axes([0.08, 0.1, 0.4, 0.8])  # correction map
+    ax1 = fig1.add_axes([0.6, 0.6, 0.35, 0.31]) # X residual
+    ax2 = fig1.add_axes([0.6, 0.1, 0.35, 0.31]) # Y residual
     # plot difference
     cax = ax0.imshow(zz, origin='lower')
-    ax0.contour(zz, lw=0.5, c='k')
+    ax0.contour(zz, linewidths=0.5, colors='k')
     bbox0 = ax0.get_position()
     # add color bar
     axc = fig1.add_axes([bbox0.x1+0.02, bbox0.y0, 0.015, bbox0.height])
@@ -352,45 +478,14 @@ def find_distortion(data, hwidth, disp_axis, wave, linelist, deg,
         ax.axhline(-std, c='k', ls='--', lw=0.5, zorder=-1)
         ax.axhline(std, c='k', ls='--', lw=0.5, zorder=-1)
 
-    # plot the distortion curve
-    fig3 = plt.figure()
-    ax3 = fig3.gca()
-    #ax3.imshow(np.log10(data), cmap='gray')
-    for y in np.linspace(0, ny-1, 10):
-        x_lst = np.linspace(0, nx-1, 100)
-        y_lst = np.repeat(y, x_lst.size)
-        #ax3.plot(x_lst, y_lst, '-', lw=0.5)
-        dc_lst = polyval2d(coeff, x_lst/nx, y_lst/ny)
-        ax3.plot(x_lst, y_lst, '--', c='k', lw=0.5)
-        ax3.plot(x_lst, y_lst+dc_lst*10, '-', c='k', lw=0.5)
-
     plt.show()
 
-    if disp_axis=='x':
-        return Distortion(coeff, nx=ny, ny=nx, disp_axis=disp_axis)
-    elif disp_axis=='y':
-        return Distortion(coeff, nx=nx, ny=ny, disp_axis=disp_axis)
+    if transpose:
+        axis = 'x'
     else:
-        raise ValueError
+        axis = 'y'
+    return Distortion(coeff, nx=nx, ny=ny, axis=axis)
 
-def correct_distortion(data, distortion):
-    ny, nx = data.shape
-    if (nx, ny) != (distortion.nx, distortion.ny):
-        raise ValueError
-
-    newdata = np.zeros_like(data)
-    ally = np.arange(ny)
-
-    yy, xx = np.mgrid[:ny:, :nx:]
-    dc = polyval2d(distortion.coeff, xx/nx, yy/ny)
-
-    for x in np.arange(nx):
-        dc_lst = dc[:, x]
-        flux = data[:, x]
-        func = intp.InterpolatedUnivariateSpline(
-                ally-dc_lst, flux, k=3, ext=1)
-        newdata[:, x] = func(ally)
-    return newdata
 
 
 def find_longslit_wavelength(spec, ref_wave, ref_flux, shift_range, linelist,

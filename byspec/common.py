@@ -163,8 +163,8 @@ class Distortion(object):
             c1, c2 = colors, colors
 
         # plot the distortion curve
-        fig = plt.figure(dpi=150)
-        ax = fig.gca()
+        fig = plt.figure(dpi=150, figsize=(5.5, 5))
+        ax = fig.add_axes([0.12, 0.1, 0.82, 0.82], aspect=1)
         #ax.imshow(np.log10(data), cmap='gray')
 
         # plot the vertical lines
@@ -196,6 +196,15 @@ class Distortion(object):
                 y_lst += dc_lst*times
 
             ax.plot(x_lst, y_lst, ls=ls2, c=c2, lw=lw2)
+
+        xlabel = 'X (pixel)'
+        ylabel = 'Y (pixel)'
+        if self.axis=='x':
+            xlabel += ' (Dispertion Direction)'
+        else:
+            ylabel += ' (Dispertion Direction)'
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
 
         return fig
 
@@ -436,25 +445,30 @@ def find_distortion(data, hwidth, disp_axis, linelist, deg,
 
 
     # plot the 3d fitting
-    fig3d = plt.figure(dpi=200)
-    ax1 = fig3d.add_subplot(projection='3d')
-    ax1.scatter(all_x_lst[m], all_y_lst[m], all_dc_lst[m], c='C0')
-    ax1.scatter(all_x_lst[~m], all_y_lst[~m], all_dc_lst[~m], c='C3')
+    fig3d = plt.figure(dpi=200, figsize=(4.3,4))
+    ax1 = fig3d.add_axes([0.0, 0.05, 0.92, 0.91], projection='3d')
+    #ax1 = fig3d.add_subplot(projection='3d')
+    ax1.scatter(all_x_lst[m], all_y_lst[m], all_dc_lst[m], c='C0', s=10, lw=0)
+    ax1.scatter(all_x_lst[~m], all_y_lst[~m], all_dc_lst[~m], c='C3', s=10, lw=0)
     # plot the 3d surface
     yy, xx = np.mgrid[:ny:, :nx:]
     zz = polyval2d(coeff, xx/nx, yy/ny)
     ax1.plot_surface(xx, yy, zz, lw=0.5, alpha=0.5)
     ax1.set_xlabel('X (pixel)')
     ax1.set_ylabel('Y (pixel)')
+    ax1.set_zlabel(u'\u0394 {}'.format(disp_axis.upper()))
     
     # plot the 2D figure
-    fig1 = plt.figure(dpi=150, figsize=(16,9))
-    ax0 = fig1.add_axes([0.08, 0.1, 0.4, 0.8])  # correction map
-    ax1 = fig1.add_axes([0.6, 0.6, 0.35, 0.31]) # X residual
-    ax2 = fig1.add_axes([0.6, 0.1, 0.35, 0.31]) # Y residual
+    fig1 = plt.figure(dpi=200, figsize=(10, 5.4))
+    ax0 = fig1.add_axes([0.08, 0.05, 0.44, 0.89])  # correction map
+    ax1 = fig1.add_axes([0.63, 0.60, 0.34, 0.35]) # X residual
+    ax2 = fig1.add_axes([0.63, 0.05, 0.34, 0.35]) # Y residual
     # plot difference
     cax = ax0.imshow(zz, origin='lower')
-    ax0.contour(zz, linewidths=0.5, colors='k')
+    cs = ax0.contour(zz, linewidths=0.5, colors='k')
+    ax0.clabel(cs, inline=1, fontsize=9, use_clabeltext=True)
+    ax0.set_xlabel('X (pixel)')
+    ax0.set_ylabel('Y (pixel)')
     bbox0 = ax0.get_position()
     # add color bar
     axc = fig1.add_axes([bbox0.x1+0.02, bbox0.y0, 0.015, bbox0.height])
@@ -478,15 +492,12 @@ def find_distortion(data, hwidth, disp_axis, linelist, deg,
         ax.axhline(-std, c='k', ls='--', lw=0.5, zorder=-1)
         ax.axhline(std, c='k', ls='--', lw=0.5, zorder=-1)
 
-    plt.show()
-
     if transpose:
         axis = 'x'
     else:
         axis = 'y'
-    return Distortion(coeff, nx=nx, ny=ny, axis=axis)
 
-
+    return Distortion(coeff, nx=nx, ny=ny, axis=axis), fig1, fig3d
 
 def find_longslit_wavelength(spec, ref_wave, ref_flux, shift_range, linelist,
         window=17, deg=4, clipping=3, q_threshold=0):
@@ -736,11 +747,11 @@ def find_longslit_wavelength(spec, ref_wave, ref_flux, shift_range, linelist,
     linelist.meta.clear()
 
     # plot wavelength solution
-    fig_sol = plt.figure(figsize=(12, 6), dpi=300)
-    axt1 = fig_sol.add_axes([0.07, 0.40, 0.44, 0.52])
-    axt2 = fig_sol.add_axes([0.07, 0.10, 0.44, 0.26])
-    axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
-    axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
+    fig_sol = plt.figure(figsize=(8, 6), dpi=200)
+    axt1 = fig_sol.add_axes([0.10, 0.40, 0.86, 0.52])
+    axt2 = fig_sol.add_axes([0.10, 0.10, 0.86, 0.26])
+    #axt4 = fig_sol.add_axes([0.58, 0.54, 0.37, 0.38])
+    #axt5 = fig_sol.add_axes([0.58, 0.10, 0.37, 0.38])
 
     axt1.plot(pixel_lst, allwave, c='k', lw=0.6, zorder=10)
     species = np.unique(species_lst)
@@ -780,11 +791,11 @@ def find_longslit_wavelength(spec, ref_wave, ref_flux, shift_range, linelist,
     axt2.xaxis.set_major_locator(tck.MultipleLocator(200))
     axt2.xaxis.set_minor_locator(tck.MultipleLocator(50))
     axt1.set_xticklabels([])
-    axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
-    axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
-    axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
-    axt5.set_xlabel('Pixel')
-    axt5.set_ylabel(u'dv/dx (km/s)')
+    #axt4.plot(pixel_lst[0:-1], -np.diff(allwave))
+    #axt5.plot(pixel_lst[0:-1], -np.diff(allwave) / (allwave[0:-1]) * 299792.458)
+    #axt4.set_ylabel(u'd\u03bb/dx (\xc5)')
+    #axt5.set_xlabel('Pixel')
+    #axt5.set_ylabel(u'dv/dx (km/s)')
 
     return {'wavelength': allwave,
             'linelist': linelist,
@@ -792,3 +803,292 @@ def find_longslit_wavelength(spec, ref_wave, ref_flux, shift_range, linelist,
             'fig_solution': fig_sol,
             'fig_fitlbl': fig_lbl_lst,
             }
+
+def find_echelle_wavelength(spec, ref_spec, shift_range, linelist,
+        window=15, xdeg=4, ydeg=4, clipping=3, q_threshold=10):
+    
+    def errfunc(p, x, y, fitfunc):
+        return y - fitfunc(p, x)
+    def fitline(p, x):
+        nline = int((len(p)-1)/4)
+        y = np.ones_like(x, dtype=np.float64) + p[0]
+        for i in range(nline):
+            A, alpha, beta, center = p[i*4+1:i*4+5]
+            y = y + gengaussian(A, alpha, beta, center, x)
+        return y
+
+    shift_lst = np.arange(shift_range[0], shift_range[1])
+
+    allwave = {}
+    all_res_lst = []
+
+    # initialize line-by-line figure
+    fig_lbl_lst = []
+    nrow, ncol = 6, 7       # the number of sub-axes in every figure
+    count_line = 0  # fitting counter
+
+    figccf = plt.figure()
+    axccf = figccf.gca()
+
+    fig_sol = plt.figure(dpi=150, figsize=(10,5))
+    axsol = fig_sol.add_axes([0.08, 0.10, 0.42, 0.85])
+    axresx = fig_sol.add_axes([0.58, 0.57, 0.4, 0.38])
+    axresy = fig_sol.add_axes([0.58, 0.10, 0.4, 0.38])
+
+    for irow in np.arange(len(spec)):
+        ccf_lst = get_simple_ccf(spec[irow]['flux'],
+                                 ref_spec[irow]['flux'], shift_lst)
+        axccf.plot(shift_lst, ccf_lst, '-', lw=0.5, alpha=0.7)
+
+        shift = shift_lst[ccf_lst.argmax()]
+
+        ref_wave = ref_spec[irow]['wavelength']
+        ref_flux  = ref_spec[irow]['flux']
+        ref_pixel = np.arange(ref_wave.size)
+
+        # construct an interpolate function that converts wavelength to pixel
+        # before constructing the function, the reference wavelength should be
+        # increased
+        if ref_wave[0] > ref_wave[-1]:
+            ref_wave = ref_wave[::-1]
+            ref_flux = ref_flux[::-1]
+            ref_pixel = ref_pixel[::-1]
+
+        # constrcut the interpolate function
+        f_wave_to_pix = intp.InterpolatedUnivariateSpline(
+                ref_wave, ref_pixel, k=3)
+
+        order = ref_spec[irow]['order']
+        sublinelist = linelist[linelist['order']==order]
+        sublinelist.add_column([-1]*len(sublinelist), index=-1, name='pixel')
+        sublinelist.add_column([-1]*len(sublinelist), index=-1, name='i1')
+        sublinelist.add_column([-1]*len(sublinelist), index=-1, name='i2')
+
+        n = spec[irow]['flux'].size
+        pixel_lst = np.arange(n)
+
+        hwin = int(window/2)
+        
+        for iline, line in enumerate(sublinelist):
+            pix1 = f_wave_to_pix(line['wavelength']) + shift
+            cint1 = int(round(pix1))
+            i1, i2 = cint1 - hwin, cint1 + hwin+1
+            i1 = max(i1, 0)
+            i2 = min(i2, n-1)
+            sublinelist[iline]['pixel'] = cint1
+            sublinelist[iline]['i1'] = i1
+            sublinelist[iline]['i2'] = i2
+
+            
+        m = (sublinelist['pixel']>0)*(sublinelist['pixel']<n-1)
+        sublinelist = sublinelist[m]
+
+        # resort
+        sublinelist.sort('pixel')
+
+        wave_lst, species_lst = [], []
+        # fitting parameter results
+        alpha_lst, beta_lst, center_lst = [], [], []
+        A_lst, bkg_lst, std_lst, fwhm_lst, q_lst = [], [], [], [], []
+
+        for iline, line in enumerate(sublinelist):
+            i1 = line['i1']
+            i2 = line['i2']
+            ic = line['pixel']
+            # add background level
+            ydata = spec[irow]['flux'][i1:i2]
+            p0 = [ydata.min()]
+            p0.append(spec[irow]['flux'][ic]-ydata.min())
+            p0.append(3.6)
+            p0.append(3.5)
+            p0.append(line['pixel'])
+
+            lower_bounds = [-np.inf, 0,      0.5, 0.1, i1]
+            upper_bounds = [np.inf,  np.inf, 20,   20, i2]
+
+            xdata = np.arange(i1, i2)
+            fitres = opt.least_squares(errfunc, p0,
+                        bounds=(lower_bounds, upper_bounds),
+                        args=(xdata, ydata, fitline),
+            )
+
+            param = fitres['x']
+
+            fmt_str = (' - {:2s} {:3s} {:10.4f}: {:4d}-{:4d} '
+                       'alpha={:6.3f} beta={:6.3f} center={:8.3f} fwhm={:6.2f} '
+                       'q={:6.2f}')
+
+            A, alpha, beta, center = param[1:5]
+            fwhm = 2*alpha*np.power(np.log(2), 1/beta)
+            std = np.sqrt(fitres['cost']*2/xdata.size)
+            q = A/std
+
+            wave_lst.append(line['wavelength'])
+            species_lst.append('{} {}'.format(line['element'], line['ion']))
+            # append fitting results
+            center_lst.append(center)
+            A_lst.append(A)
+            alpha_lst.append(alpha)
+            beta_lst.append(beta)
+            fwhm_lst.append(fwhm)
+            bkg_lst.append(param[0])
+            std_lst.append(std)
+            q_lst.append(q)
+
+            print(fmt_str.format(line['element'], line['ion'], line['wavelength'],
+                    i1, i2, alpha, beta, center, fwhm, q, count_line))
+
+            sublinelist['i1'][iline] = i1
+            sublinelist['i2'][iline] = i2
+
+            # plot line-by-line
+            # create figure
+            if count_line%(nrow*ncol)==0:
+                fig_lbl = plt.figure(figsize=(16, 9), dpi=150,
+                                     tight_layout=True)
+                fig_lbl_lst.append(fig_lbl)
+            # create small axes
+            axs = fig_lbl.add_subplot(nrow, ncol, count_line%(nrow*ncol)+1)
+            axs.plot(xdata, ydata*1e-3, 'o', c='C0', ms=4, alpha=0.7)
+            # plot fitted curve
+            newx = np.linspace(xdata[0], xdata[-1], 100)
+            newy = fitline(param, newx)
+            axs.plot(newx, newy*1e-3, ls='-', color='C1', lw=0.7, alpha=0.7)
+            
+            # draw text and plot line center as vertical lines
+            axs.axvline(x=center, color='k', ls='--', lw=0.7)
+            text = 'Order {}, {} {} {:9.4f}'.format(order,
+                    line['element'], line['ion'], line['wavelength'])
+            
+            axs.set_xlim(newx[0], newx[-1])
+            _x1, _x2 = axs.get_xlim()
+            _y1, _y2 = axs.get_ylim()
+            _y2 = _y2 + 0.2*(_y2 - _y1)
+            axs.text(0.95*_x1+0.05*_x2, 0.05*_y1+0.95*_y2, text,
+                     ha='left', va='top', fontsize=8)
+            axs.set_ylim(_y1, _y2)
+            if _x2 -_x1 < 25:
+                major_tick, minor_tick = 5, 1
+            else:
+                major_tick, minor_tick = 10, 1
+            axs.xaxis.set_major_locator(tck.MultipleLocator(major_tick))
+            axs.xaxis.set_minor_locator(tck.MultipleLocator(minor_tick))
+
+            for tick in axs.xaxis.get_major_ticks():
+                tick.label1.set_fontsize(7)
+            for tick in axs.yaxis.get_major_ticks():
+                tick.label1.set_fontsize(7)
+
+            count_line += 1
+
+        ###################################################
+        # fit wavelength solution
+        # resort the pixel list and wavelength list
+        wave_lst = np.array(wave_lst)
+        center_lst = np.array(center_lst)
+        A_lst = np.array(A_lst)
+        std_lst = np.array(std_lst)
+        q_lst = np.array(q_lst)
+
+        # resort the center list
+        idx = center_lst.argsort()
+        center_lst = center_lst[idx]
+        wave_lst = wave_lst[idx]
+    
+        # begin wavelength solution fit
+        mask = q_lst > q_threshold
+        if mask.sum() >= xdeg+1:
+            # fit the wavelength of this order
+            for i in range(10):
+                coeff_wave = np.polyfit(center_lst[mask], wave_lst[mask],
+                                        deg=xdeg)
+                fitwave = np.polyval(coeff_wave, center_lst)
+                reswave = wave_lst - fitwave
+                stdwave = reswave[mask].std()
+                newmask = (np.abs(reswave) < clipping*stdwave)*(q_lst>q_threshold)
+                if newmask.sum()==mask.sum():
+                    break
+                mask = newmask
+                if mask.sum() < xdeg+1:
+                    break
+            # get wavelength of each pixel in this order
+            wave = np.polyval(coeff_wave, pixel_lst)
+            allwave[order] = wave
+            has_wave = True
+            for res in reswave[mask]:
+                all_res_lst.append(res)
+        else:
+            wave = np.zeros_like(pixel_lst, dtype=np.float64)
+            has_wave = False
+
+        # plot wavelength solutions
+        color = 'C{}'.format(order%10)
+
+        if mask.sum()>0:
+            # plot wavelength solution of each order
+            axsol.plot(center_lst[mask], wave_lst[mask], 'o',
+                       c=color, ms=4, alpha=0.8, mew=0)
+            # plot residuals only when there is a fitting
+            if has_wave:
+                axresx.plot(center_lst[mask], reswave[mask], 'o',
+                            c=color, ms=4, alpha=0.8, mew=0, lw=0.6)
+                axresy.plot(np.repeat(order, mask.sum()), reswave[mask], 'o',
+                            c=color, ms=4, alpha=0.8, mew=0, lw=0.6)
+        if (~mask).sum() > 0:
+            axsol.plot(center_lst[~mask], wave_lst[~mask], 'o',
+                       c='none', mec=color, ms=3)
+            # plot residuals only when there is a fitting
+            if has_wave:
+                axresx.plot(center_lst[~mask], reswave[~mask], 'o',
+                            c='none', mec=color, ms=3, alpha=0.8, mew=0.5)
+                axresy.plot(np.repeat(order, (~mask).sum()), reswave[~mask], 'o',
+                            c='none', mec=color, ms=3, alpha=0.8, mew=0.5)
+
+        if (wave > 0).sum()>0:
+            axsol.plot(pixel_lst, wave, '-', c=color, lw=0.5)
+
+
+    all_res_lst = np.array(all_res_lst)
+    allstd = all_res_lst.std()
+
+    nused = all_res_lst.size
+
+
+    # interpolate wavelength
+
+    axresx.axhline(0, ls='--', color='k', lw=0.5)
+    axresx.axhline(allstd, ls='--', color='k', lw=0.5)
+    axresx.axhline(-allstd, ls='--', color='k', lw=0.5)
+    axresy.axhline(0, ls='--', color='k', lw=0.5)
+    axresy.axhline(allstd, ls='--', color='k', lw=0.5)
+    axresy.axhline(-allstd, ls='--', color='k', lw=0.5)
+
+
+    axsol.set_xlabel('Pixel')
+    axsol.set_ylabel(u'Wavelength (\xc5)')
+    axsol.set_xlim(0, n-1)
+
+    axresx.set_xlabel('Pixel')
+    axresy.set_xlabel('Order')
+    axresx.set_ylabel(u'\u0394\u03bb (\xc5)')
+    axresy.set_ylabel(u'\u0394\u03bb (\xc5)')
+
+    axresx.set_ylim(-5*allstd, 5*allstd)
+    axresy.set_ylim(-5*allstd, 5*allstd)
+    axresx.set_xlim(0, n-1)
+
+    _x1, _x2 = axresy.get_xlim()
+    _y1, _y2 = axresy.get_ylim()
+    axresy.text(0.95*_x1+0.05*_x2, 0.1*_y1+0.9*_y2,
+                'N (used) = {}, R.M.S. = {:.4f}'.format(nused, allstd))
+    axresy.set_xlim(_x1, _x2)
+    axresy.set_ylim(_y1, _y2)
+
+    return {#'wavelength': allwave,
+            'linelist': linelist,
+            #'std': stdwave,
+            'fig_solution': fig_sol,
+            'fig_fitlbl': fig_lbl_lst,
+            }
+
+    #plt.show()

@@ -223,4 +223,3 @@ def get_local_minima(x, window=None):
         else:
             return np.array([]), np.array([])
 
-

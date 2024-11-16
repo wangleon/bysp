@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as tck
 
 from .utils import get_file
-from .imageproc import combine_images
+from .imageproc import combine_images, savgol_filter_2d
 from .onedarray import (iterative_savgol_filter, get_simple_ccf,
                         gaussian, gengaussian,
                         consecutive, find_shift_ccf, get_clip_mean,
@@ -21,7 +21,7 @@ from .onedarray import (iterative_savgol_filter, get_simple_ccf,
 from .visual import plot_image_with_hist
 
 from .common import (FOSCReducer, find_longslit_wavelength,
-                     find_distortion)
+                     find_distortion, find_echelle_wavelength)
 
 def print_wrapper(string, item):
     """A wrapper for obslog printing
@@ -430,28 +430,29 @@ def find_echelle_apertures(data, align_deg, scan_step):
             break
     #ax31.plot(order_lst[goodmask], order_cen_lst[goodmask], 'o', c='C0', ms=2)
 
-
-    fig2 = plt.figure()
-    ax2 = fig2.gca()
-    ax2.plot(x, y, lw=0.5)
+    # plot co-added cross-order profiles
+    fig2 = plt.figure(dpi=200, figsize=(6, 3.7))
+    ax2 = fig2.add_axes([0.12, 0.13, 0.85, 0.83])
+    ax2.plot(x, y, lw=0.8)
     #ax2.plot(x[aper_idx], y[aper_idx], 'o', ms=1)
     ax2.plot(x, np.exp(newy), '-')
+    ax2.set_yscale('log')
     _y1, _y2 = ax2.get_ylim()
     for iorder, (i1, i2) in enumerate(order_index_lst):
         if goodmask[iorder]:
             color = 'C0'
         else:
             color = 'C1'
-        ax2.fill_betweenx([_y1, _y2], x[i1], x[i2], color=color, alpha=0.1, lw=0)
+        ax2.fill_betweenx([_y1, _y2], x[i1], x[i2], color=color, alpha=0.2, lw=0)
     ax2.plot(x, np.exp(newy+3*std), '--')
-    ax2.set_yscale('log')
-    ax2.set_ylim(_y1, _y2)
+    ax2.set_ylim(_y1,_y2)
+    ax2.set_xlabel('Y (pixel)')
+    ax2.set_ylabel('Flux')
 
-
-
-    fig = plt.figure()
-    ax = fig.gca()
-    ax.imshow(np.log10(data))
+    # plot all detected orders
+    fig = plt.figure(dpi=200, figsize=(6, 3.7))
+    ax = fig.add_axes([0.12, 0.13, 0.85, 0.83])
+    ax.imshow(np.log10(data), cmap='gray')
 
     coeff_lst = []
     for iorder, (i1, i2) in enumerate(order_index_lst):
@@ -476,16 +477,15 @@ def find_echelle_apertures(data, align_deg, scan_step):
         coeff_lst.append(c)
 
         if goodmask[iorder]:
-            color = 'r'
+            color = 'C0'
             ls = '-'
         else:
-            color = 'orange'
+            color = 'C1'
             ls = '--'
         # plot node
         #ax.plot(xnode_lst, ynode_lst, ls=ls, c=color, lw=0.5)
         # plot positions
         ax.plot(allx, np.polyval(c, allx), ls=ls, c=color, lw=0.5)
-
 
         #fig0 = plt.figure()
         #ax01 = fig0.add_subplot(211)
@@ -498,9 +498,10 @@ def find_echelle_apertures(data, align_deg, scan_step):
         
     ax.set_xlim(0, nx-1)
     ax.set_ylim(0, ny-1)
-    plt.show()
+    ax.set_xlabel('X (pixel)')
+    ax.set_ylabel('Y (pixel)')
 
-    return coeff_lst, goodmask
+    return coeff_lst, goodmask, fig, fig2
 
 
 def get_longslit_sensmap(data):
@@ -509,14 +510,18 @@ def get_longslit_sensmap(data):
     ally = np.arange(ny)
     sensmap = np.ones_like(data, dtype=np.float64)
 
-    for y in np.arange(ny):
-        #fluxt1d = self.flat_data[y, 20:int(nx) - 20]
-        flux1d = data[y, :]
-        flux1d_sm, _, mask, std = iterative_savgol_filter(
-                                    flux1d,
-                                    winlen=51, order=3, mode='interp',
-                                    upper_clip=6, lower_clip=6, maxiter=10)
-        sensmap[y, :] = flux1d/flux1d_sm
+    #for y in np.arange(ny):
+    #    #fluxt1d = self.flat_data[y, 20:int(nx) - 20]
+    #    flux1d = data[y, :]
+    #    flux1d_sm, _, mask, std = iterative_savgol_filter(
+    #                                flux1d,
+    #                                winlen=51, order=3, mode='interp',
+    #                                upper_clip=6, lower_clip=6, maxiter=10)
+    #    sensmap[y, :] = flux1d/flux1d_sm
+
+    newdata = data[3:, :]
+    smoothed = savgol_filter_2d(newdata, window_length=151, order=3)
+    sensmap[3:, :] = newdata/smoothed
 
     return sensmap
 
@@ -552,6 +557,20 @@ class BFOSC(FOSCReducer):
             if fname.startswith(str(fileid)):
                 return os.path.join(self.rawdata_path, fname)
         raise ValueError
+
+
+    def has_echelle(self):
+        for logitem in self.logtable:
+            if logitem['mode']=='echelle':
+                return True
+        return False
+
+    def has_longslit(self):
+        for logitem in self.logtable:
+            if logitem['mode']=='longslit':
+                return True
+        return False
+
 
     def get_bias(self):
 
@@ -686,121 +705,159 @@ class BFOSC(FOSCReducer):
         binning, gain, rdnoise = ccdconf
         return '{}_gain{:.1f}_ron{}'.format(binning, gain, rdnoise)
 
-    def trace(self):
-        if self.mode != 'echelle':
-            raise ValueError
+    def find_echelle_orders(self):
 
-        # crop
-        data = self.flat_data[800:, :]
-
-        coeff_lst, goodmask = find_echelle_apertures(data,
-                                scan_step=50, align_deg=3)
-        self.coeff_lst = coeff_lst
-        self.goodmask = goodmask
-
-    def get_echelle_sens(self):
-        data = self.flat_data[800:, :]
-        ny, nx = data.shape
-        allx = np.arange(nx)
-        ally = np.arange(ny)
-
-        # fix flat data
-        #m = np.ones(ny, dtype=bool)
-        #m[1537-800:1538+1-800] = False
-        #fixdata = data.copy()
-        #fig = plt.figure()
-        #ax = fig.gca()
-        #for x in np.arange(nx):
-        #    flux = np.log(data[:, x])
-        #    fixfunc = intp.InterpolatedUnivariateSpline(ally[m], flux[m], k=2)
-        #    fixdata[:, x][~m] = np.exp(fixfunc(ally[~m]))
-        #    if 320 < x < 330:
-        #        ax.plot(ally, flux, '-')
-        #        ax.plot(ally[m], flux[m], '--')
-        #        ax.plot(ally[~m], fixdata[:,x][~m], 'o')
-        #plt.show()
-        #data = fixdata
-
-        yy, xx = np.mgrid[:ny:, :nx:]
-        sensmap = np.ones_like(data, dtype=np.float32)
-
-        fig = plt.figure()
-        ax = fig.gca()
-        ax.imshow(np.log10(data))
-        fig2 = plt.figure()
-        ax2 = fig2.gca()
-
-        allmask = np.zeros_like(data, dtype=bool)
-        for iorder, coeff in enumerate(self.coeff_lst):
-            win = 5
-
-            cen_lst = np.polyval(coeff, allx)
-            ax.plot(allx, cen_lst, c='r', ls='-', lw=0.5)
-
-            mask = (yy<cen_lst+win)*(yy>cen_lst-win)
-            allmask += (yy<cen_lst+win+5)*(yy>cen_lst-win-5)
-
-            # skip ghost orders
-            if not self.goodmask[iorder]:
+        self.echelle_coeff_lst = {}
+        self.echelle_goodmask = {}
+        for conf, flat_data in self.flat.items():
+            if conf[0]!='echelle':
                 continue
 
-            spec = (data*mask).sum(axis=0)/10
-            ax2.plot(spec, lw=0.5)
-           
-            fig0 =plt.figure(dpi=200)
-            ax0 = fig0.gca()
-            ax0.plot(spec, lw=0.5)
-            ## smooth
+            # trim the image
+            data = flat_data[800:, :]
 
-            #spec_sm, _, m, std = iterative_savgol_filter(spec,
-            #                    winlen=21, order=3,
-            #                    upper_clip=5, lower_clip=5, maxiter=5)
-           
+            # find apertures
+            result = find_echelle_apertures(data,
+                                scan_step=50, align_deg=3)
+            coeff_lst = result[0]
+            goodmask  = result[1]
+            fig_orders = result[2]
+            fig_section = result[3]
 
-            #core = sg.gaussian(15, std=3)
-            #core /= core.sum()
-            #spec_sm = np.convolve(spec, core, mode='same')
+            conf_string = self.get_conf_string(conf)
 
-            m = np.ones_like(spec, dtype=bool)
-            for i in range(3):
-                coeff = np.polyfit(allx[m], spec[m], deg=7)
-                res_lst = spec - np.polyval(coeff, allx)
-                std = res_lst[m].std()
-                newm = (res_lst > -3*std) * (res_lst < 3*std)
-                if newm.sum()==m.sum():
-                    break
-                m = newm
-            spec_sm = np.polyval(coeff, allx)
+            figfilename = 'echelle_orders_{}.pdf'.format(conf_string)
+            fig_orders.savefig(figfilename)
+            plt.close(fig_orders)
+
+            figfilename = 'echelle_sections_{}.pdf'.format(conf_string)
+            fig_section.savefig(figfilename)
+            plt.close(fig_section)
+
+            self.echelle_coeff_lst[conf] = coeff_lst
+            self.echelle_goodmask[conf] = goodmask
+
+    def get_echelle_sens(self):
+
+        self.echelle_sens = {}
+        for conf, flat_data in self.flat.items():
+            if conf[0] != 'echelle':
+                continue
+
+            conf_string = self.get_conf_string(conf)
+
+            echelle_coeff_lst = self.echelle_coeff_lst[conf]
+            echelle_goodmask  = self.echelle_goodmask[conf]
+
+            # trim the image
+            data = flat_data[800:, :]
+            ny, nx = data.shape
+            allx = np.arange(nx)
+            ally = np.arange(ny)
+
+            # fix flat data
+            #m = np.ones(ny, dtype=bool)
+            #m[1537-800:1538+1-800] = False
+            #fixdata = data.copy()
+            #fig = plt.figure()
+            #ax = fig.gca()
+            #for x in np.arange(nx):
+            #    flux = np.log(data[:, x])
+            #    fixfunc = intp.InterpolatedUnivariateSpline(ally[m], flux[m], k=2)
+            #    fixdata[:, x][~m] = np.exp(fixfunc(ally[~m]))
+            #    if 320 < x < 330:
+            #        ax.plot(ally, flux, '-')
+            #        ax.plot(ally[m], flux[m], '--')
+            #        ax.plot(ally[~m], fixdata[:,x][~m], 'o')
+            #plt.show()
+            #data = fixdata
+
+            yy, xx = np.mgrid[:ny:, :nx:]
+            sensmap = np.ones_like(data, dtype=np.float32)
+
+            #fig = plt.figure()
+            #ax = fig.gca()
+            #ax.imshow(np.log10(data))
+            #fig2 = plt.figure()
+            #ax2 = fig2.gca()
+
+            allmask = np.zeros_like(data, dtype=bool)
+            for iorder, coeff in enumerate(echelle_coeff_lst):
+                win = 5
+            
+                cen_lst = np.polyval(coeff, allx)
+                #ax.plot(allx, cen_lst, c='r', ls='-', lw=0.5)
+            
+                mask = (yy<cen_lst+win)*(yy>cen_lst-win)
+                allmask += (yy<cen_lst+win+5)*(yy>cen_lst-win-5)
+            
+                # skip ghost orders
+                if not echelle_goodmask[iorder]:
+                    continue
+            
+                spec = (data*mask).sum(axis=0)/10
+                #ax2.plot(spec, lw=0.5)
+               
+                #fig0 =plt.figure(dpi=200)
+                #ax0 = fig0.gca()
+                #ax0.plot(spec, lw=0.5)
+                ## smooth
+            
+                #spec_sm, _, m, std = iterative_savgol_filter(spec,
+                #                    winlen=21, order=3,
+                #                    upper_clip=5, lower_clip=5, maxiter=5)
+               
+            
+                #core = sg.gaussian(15, std=3)
+                #core /= core.sum()
+                #spec_sm = np.convolve(spec, core, mode='same')
+            
+                m = np.ones_like(spec, dtype=bool)
+                m2 = (cen_lst>0)*(cen_lst<ny)
+                for i in range(3):
+                    m = m*m2
+                    coeff = np.polyfit(allx[m]/nx, np.log(spec[m]), deg=7)
+                    res_lst = np.log(spec) - np.polyval(coeff, allx/nx)
+                    std = res_lst[m].std()
+                    newm = (res_lst > -3*std) * (res_lst < 3*std)
+                    if newm.sum()==m.sum():
+                        break
+                    m = newm
+                spec_sm = np.zeros(nx)
+                spec_sm[m2] = np.exp(np.polyval(coeff, allx/nx)[m2])
+            
+                #ax0.plot(allx, spec_sm, lw=0.5)
+                minidx, minvalue = get_local_minima(spec_sm, window=31)
+                #ax0.plot(minidx, minvalue, 'o', ms=2, alpha=0.6)
+                #fig0.savefig('smooth_{:02d}.png'.format(iorder))
+                #plt.close(fig0)
+            
+                smooth_2d = np.tile(spec_sm, ny).reshape(ny, -1)
+                sensmap[mask] = (data/smooth_2d)[mask]
+                #sensmap[:,m2][mask[:,m2]] = (data[:, m2]/smooth_2d)
+            
         
-            ax0.plot(spec_sm, lw=0.5)
-            minidx, minvalue = get_local_minima(spec_sm, window=31)
-            ax0.plot(minidx, minvalue, 'o', ms=2, alpha=0.6)
-            fig0.savefig('smooth_{:02d}.png'.format(iorder))
-            plt.close(fig0)
-
-            smooth_2d = np.tile(spec_sm, ny).reshape(ny, nx)
-            sensmap[mask] = (data/smooth_2d)[mask]
-
-    
-
-        hdulst = fits.HDUList([fits.PrimaryHDU(data=data),
-                               fits.ImageHDU(data=np.int16(~allmask)),
-                               ])
-        hdulst.writeto('flat_background.fits', overwrite=True)
-
-        fig3 = plt.figure()
-        ax3 = fig3.gca()
-        ax3.imshow(np.log10(data*(~allmask)))
-
-        fig4 = plt.figure()
-        ax4 = fig4.gca()
-        ax4.imshow(sensmap)
-
-        fits.writeto('sens.fits', sensmap, overwrite=True)
-
-        plt.show()
-
-        self.sens_data = sensmap
+            ### tmp
+            #hdulst = fits.HDUList([fits.PrimaryHDU(data=data),
+            #                       fits.ImageHDU(data=np.int16(~allmask)),
+            #                       ])
+            #hdulst.writeto('flat_background.fits', overwrite=True)
+            ### tmp
+            
+            #fig3 = plt.figure()
+            #ax3 = fig3.gca()
+            #ax3.imshow(np.log10(data*(~allmask)))
+            
+            #fig4 = plt.figure()
+            #ax4 = fig4.gca()
+            #ax4.imshow(sensmap)
+            
+            fits.writeto('sens_{}.fits'.format(conf_string),
+                         sensmap, overwrite=True)
+            
+            #plt.show()
+            
+            self.echelle_sens[conf] = sensmap
 
     def get_longslit_sens(self):
         self.sensmap = {}
@@ -816,10 +873,10 @@ class BFOSC(FOSCReducer):
 
 
     def extract_echelle_lamp(self):
-        lamp_item_lst = filter(lambda item: item['datatype']=='SPECSLAMP',
-                               self.logtable)
 
-        nx = self.flat_data.shape[1]
+        self.echelle_arclamp = {}
+
+        nx = list(self.echelle_sens.values())[0].shape[1]
         # define dtype of 1-d spectra
         types = [
                 ('aperture',   np.int16),
@@ -832,23 +889,38 @@ class BFOSC(FOSCReducer):
         names, formats = list(zip(*types))
         wlcalib_spectype = np.dtype({'names': names, 'formats': formats})
 
+        for logitem in self.logtable:
 
-        for logitem in lamp_item_lst:
+            if logitem['mode'] != 'echelle':
+                continue
+
+            if logitem['datatype'] != 'SPECSLAMP':
+                continue
+
+            ccdconf = self.get_ccdconf(logitem)
+            conf = self.get_conf(logitem)
+
             fileid = logitem['fileid']
             filename = self.fileid_to_filename(fileid)
             data, header = fits.getdata(filename, header=True)
-            data = data - self.bias_data
+
+            data = data - self.bias[ccdconf]
+            # trim image
             data = data[800:, :]
-            data = data / self.sens_data
+            data = data / self.echelle_sens[conf]
+
             ny, nx = data.shape
             allx = np.arange(nx)
             yy, xx = np.mgrid[:ny:, :nx:]
 
+            echelle_coeff_lst = self.echelle_coeff_lst[conf]
+            echelle_goodmask  = self.echelle_goodmask[conf]
+
             spec_lst = []
             aper = 0
-            for iorder, coeff in enumerate(self.coeff_lst):
+            for iorder, coeff in enumerate(echelle_coeff_lst):
                 win = 5
-                if not self.goodmask[iorder]:
+                if not echelle_goodmask[iorder]:
                     continue
                 cen_lst = np.polyval(coeff, allx)
                 mask = (yy<cen_lst+win)*(yy>cen_lst-win)
@@ -862,12 +934,63 @@ class BFOSC(FOSCReducer):
                        )
                 spec_lst.append(row)
                 aper += 1
+
             spec_lst = np.array(spec_lst, dtype=wlcalib_spectype)
             
             hdulst = fits.HDUList([fits.PrimaryHDU(header=header),
                                    fits.BinTableHDU(data=spec_lst),
                                    ])
             hdulst.writeto('spec_{}.fits'.format(fileid), overwrite=True)
+
+            self.echelle_arclamp[fileid] = spec_lst
+
+    def ident_echelle_wavelength(self):
+        self.echelle_wave = {}
+        self.echelle_ident = {}
+
+        index_file = os.path.join(os.path.dirname(__file__),
+                                  'data/calib/wlcalib_bfosc.dat')
+
+        for logitem in self.logtable:
+            if logitem['mode']!='echelle' or logitem['datatype']!='SPECSLAMP':
+                continue
+            if logitem['fileid'] not in self.echelle_arclamp:
+                continue
+
+            fileid = logitem['fileid']
+            lamp   = logitem['object']
+
+            spec = self.echelle_arclamp[fileid]
+            
+            ref_spec, linelist = select_calib_from_database(index_file,
+                                lamp = lamp,
+                                mode = logitem['mode'],
+                                config = logitem['config'],
+                                dateobs = logitem['dateobs'],
+                                )
+
+            linelist = linelist['aperture', 'order', 'wavelength', 'element', 'ion']
+
+            result = find_echelle_wavelength(spec, ref_spec, (-50,50), linelist,
+                    window=15, xdeg=3, ydeg=3, clipping=3, q_threshold=10)
+
+
+            
+            fig_lbl_lst = result['fig_fitlbl']
+            for ifig, fig_lbl in enumerate(fig_lbl_lst):
+                figname = 'linefit_lbl_{}_{:02d}.png'.format(
+                            fileid, ifig+1)
+                fig_lbl.savefig(figname)
+                plt.close(fig_lbl)
+
+            fig_sol = result['fig_solution']
+            figname = 'wlcalib_{}.png'.format(fileid)
+            figname = 'wlcalib_{}.pdf'.format(fileid)
+            figfilename = os.path.join('./', figname)
+            fig_sol.savefig(figfilename)
+            plt.close(fig_sol)
+            
+
 
 
     def extract_lamp(self):
@@ -915,7 +1038,7 @@ class BFOSC(FOSCReducer):
                                 lamp = lamp,
                                 mode = logitem['mode'],
                                 config = logitem['config'],
-                                dateobs = logitem['dateobs'],
+                                dateobs =logitem['dateobs'],
                                 )
             ref_wave = ref_data['wavelength']
             ref_flux = ref_data['flux']
@@ -1026,101 +1149,6 @@ class BFOSC(FOSCReducer):
         ax1.set_xlabel(u'Wavelength (\xc5)')
         plt.show()
     
-    def find_distortion(self):
-
-        wavebound = 6907
-        coeff_lst = {}
-
-        fig_dist = plt.figure(figsize=(8,6), dpi=100)
-        ax_dist = fig_dist.add_axes([0.1, 0.1, 0.85, 0.8])
-
-        coeff_lst = []
-
-        for logitem_lst in self.calib_groups:
-            q95_lst = {}
-            for logitem in logitem_lst:
-                filename = self.fileid_to_filename(logitem['fileid'])
-                data = fits.getdata(filename)
-                q95 = np.percentile(data, 95)
-                q95_lst[logitem['fileid']] = q95
-            sorted_q95_lst = sorted(q95_lst.items(), key=lambda item: item[1])
-            bandselect_fileids = {
-                    'R': sorted_q95_lst[0][0], # choose the smallest as red
-                    'B': sorted_q95_lst[-1][0], # choose the largets as blue
-                    }
-
-            allwave = list(self.wave_solutions.values())[0]
-            for band in ['B', 'R']:
-                fileid = bandselect_fileids[band]
-                filename = self.fileid_to_filename(fileid)
-                data = fits.getdata(filename)
-                data = data - self.bias_data
-                data = data / self.sens_data
-                ny, nx = data.shape
-                allx = np.arange(nx)
-                ally = np.arange(ny)
-                hwidth = 5
-                ref_spec = data[ny//2-hwidth:ny//2+hwidth, :].sum(axis=0)
-                if band == 'R':
-                    mask = allwave > wavebound
-                else:
-                    mask = allwave < wavebound
-                ref_spec = ref_spec[mask]
-                xcoord = allx[mask]
-                ycoord_lst = []
-                xshift_lst = []
-
-                fig_distortion = plt.figure(dpi=100, figsize=(8, 6))
-                ax01 = fig_distortion.add_axes([0.1, 0.55, 0.85, 0.36])
-                ax02 = fig_distortion.add_axes([0.1, 0.10, 0.85, 0.36])
-                for i, y in enumerate(np.arange(100, ny-100, 200)):
-                    spec = data[y-hwidth:y+hwidth,:].sum(axis=0)
-                    spec = spec[mask]
-                    shift = find_shift_ccf(ref_spec, spec)
-                    ycoord_lst.append(y)
-                    xshift_lst.append(shift)
-                    if i == 0:
-                        ax01.plot(xcoord, spec, color='w', lw=0)
-                        y1, y2 = ax01.get_ylim()
-                        offset = (y2 - y1)/20
-                    ax01.plot(xcoord-shift, spec+offset*i, lw=0.5)
-                    ax02.plot(xcoord, spec+offset*i, lw=0.5)
-                ax01.set_xlim(xcoord[0], xcoord[-1])
-                ax02.set_xlim(xcoord[0], xcoord[-1])
-                ax02.set_xlabel('Pixel')
-                #fig.suptitle('{}'.format(fileid))
-                figname = 'distortion_{}.png'.format(band)
-                figfilename = os.path.join(self.figpath, figname)
-                fig_distortion.savefig(figfilename)
-                plt.close(fig_distortion)
-
-                coeff = np.polyfit(ycoord_lst, xshift_lst, deg=2)
-                # append to results
-                coeff_lst.append(coeff)
-
-                color = {'B': 'C0', 'R': 'C3'}[band]
-                sign =  {'B': '<',  'R': '>'}[band]
-                label = u'(\u03bb {} {} \xc5)'.format(sign, wavebound)
-                ax_dist.plot(xshift_lst, ycoord_lst, 'o', c=color,
-                             alpha=0.7, label=label)
-                ax_dist.plot(np.polyval(coeff, ally), ally, color=color,
-                             alpha=0.7)
-        ax_dist.axhline(y=ny//2, ls='-', color='k', lw=0.7)
-        ax_dist.set_ylim(0, ny - 1)
-        ax_dist.xaxis.set_major_locator(tck.MultipleLocator(1))
-        ax_dist.set_xlabel('Shift (pixel)')
-        ax_dist.set_ylabel('Y (pixel)')
-        ax_dist.grid(True, ls='--')
-        ax_dist.set_axisbelow(True)
-        ax_dist.legend(loc='upper left')
-        figname = 'distortion_fitting.png'
-        figfilename = os.path.join(self.figpath, figname)
-        fig_dist.savefig(figfilename)
-        plt.close(fig_dist)
-
-        # take the average of coeff_lst as final curve_coeff
-        self.curve_coeff = np.array(coeff_lst).mean(axis=0)
-
     def extract_longslit_arclamp(self):
         self.arclamp = {}
         for logitem in self.logtable:
@@ -1133,21 +1161,19 @@ class BFOSC(FOSCReducer):
             ccdconf = self.get_ccdconf(logitem)
             conf = self.get_conf(logitem)
 
-            filename = self.fileid_to_filename(logitem['fileid'])
+            fileid = logitem['fileid']
+
+            filename = self.fileid_to_filename(fileid)
             data = fits.getdata(filename)
             data = data - self.bias[ccdconf]
             data = data / self.sensmap[conf]
 
             ny, nx = data.shape
-            halfwidth = 5
-            spec = data[ny//2-halfwidth:ny//2+halfwidth, :].mean(axis=0)
+            winlen = 10
+            hwidth = int(winlen/2)
+            spec = data[ny//2-hwidth:ny//2+hwidth, :].mean(axis=0)
 
-            self.arclamp[logitem['fileid']] = spec
-
-            fig = plt.figure()
-            ax = fig.gca()
-            ax.plot(spec, lw=0.5)
-            plt.show()
+            self.arclamp[fileid] = spec
 
     def find_longslit_distortion(self):
 
@@ -1169,11 +1195,27 @@ class BFOSC(FOSCReducer):
             allwave = self.wave[fileid]
             linelist = self.ident[fileid]
 
-            distortion = find_distortion(data, hwidth=5, disp_axis='x',
-                                         linelist=linelist,
-                                         deg=5, xorder=3, yorder=3)
+            distortion, fig1, fig3d = find_distortion(data,
+                                        hwidth=5, disp_axis='x',
+                                        linelist=linelist,
+                                        deg=5, xorder=3, yorder=3)
+            fig1.suptitle('Distortion of {}'.format(fileid))
+            fig1.savefig('distortion_{}.pdf'.format(fileid))
+            fig1.savefig('distortion_{}.png'.format(fileid))
+            plt.close(fig1)
+            #fig3d.suptitle('Distortion of {}'.format(fileid))
+            fig3d.suptitle('BFOSC')
+            fig3d.savefig('distortion3d_{}.pdf'.format(fileid))
+            fig3d.savefig('distortion3d_{}.png'.format(fileid))
+            plt.close(fig3d)
 
+            # plot distortion map
             fig = distortion.plot(times=10)
+            fig.suptitle('BFOSC', fontsize=13)
+            fig.savefig('distortion_bfosc.pdf')
+            fig.savefig('distortion_bfosc.png')
+            plt.close(fig)
+
             newdata = distortion.correct_image(data)
 
             #fig = plt.figure()
@@ -1199,7 +1241,8 @@ class BFOSC(FOSCReducer):
 
     def extract(self, logitem):
 
-        plot_opt_columns = False    # column-by-column figure of optimal extraction
+        # column-by-column figure of optimal extraction
+        plot_opt_columns = False
 
         ccdconf = self.get_ccdconf(logitem)
         conf = self.get_conf(logitem)
@@ -1226,10 +1269,10 @@ class BFOSC(FOSCReducer):
         coeff_loc, fwhm_mean, profile_func, tracefig = result[:]
 
         # set and save figures
-        figname = 'trace_{}.png'.format(fileid)
+        figname = 'trace_{}.pdf'.format(fileid)
         figfilename = os.path.join('./', figname)
         title = 'Trace for {} ({})'.format(fileid, logitem['object'])
-        tracefig.suptitle(title)
+        #tracefig.suptitle(title)
         tracefig.savefig(figfilename)
         plt.close(tracefig)
 
@@ -1373,9 +1416,9 @@ class BFOSC(FOSCReducer):
      
         # plot a 2d image of distortion corrected image
         # and background region
-        fig3 = plt.figure(dpi=200, figsize=(12, 6))
-        ax31 = fig3.add_axes([0.07, 0.1, 0.4, 0.8])
-        ax32 = fig3.add_axes([0.55, 0.1, 0.4, 0.8])
+        fig3 = plt.figure(dpi=200, figsize=(10, 5))
+        ax31 = fig3.add_axes([0.07, 0.1, 0.42, 0.84])
+        ax32 = fig3.add_axes([0.57, 0.1, 0.42, 0.84])
         vmin = np.percentile(data, 10)
         vmax = np.percentile(data, 99)
         ax31.imshow(data, origin='lower', vmin=vmin, vmax=vmax)
@@ -1389,8 +1432,8 @@ class BFOSC(FOSCReducer):
             ax.set_xlabel('X (pixel)')
             ax.set_ylabel('Y (pixel)')
         title = '{} ({})'.format(fileid, logitem['object'])
-        fig3.suptitle(title)
-        figname = 'bkg_region_{}.png'.format(fileid)
+        #fig3.suptitle(title)
+        figname = 'bkg_region_{}.pdf'.format(fileid)
         figfilename = os.path.join('./', figname)
         fig3.savefig(figfilename)
         plt.close(fig3)
@@ -1558,12 +1601,12 @@ def trace_target(data, ypos, xstep, polyorder):
     xnode_lst, ynode_lst = [], []
 
     # make a plot
-    fig1 = plt.figure(figsize=(12, 8), dpi=200)
+    fig1 = plt.figure(figsize=(10, 6.7), dpi=200)
     w1 = 0.39
-    ax1 = fig1.add_axes([0.07, 0.43, 0.39, 0.50])
-    ax2 = fig1.add_axes([0.56, 0.07, w1, 0.22])
-    ax3 = fig1.add_axes([0.07, 0.07, 0.39, 0.30])
-    ax4 = fig1.add_axes([0.56, 0.35, w1, w1/2*3])
+    ax1 = fig1.add_axes([0.07, 0.45, 0.39, 0.50])  # upper left
+    ax2 = fig1.add_axes([0.56, 0.07, w1, 0.22])    # lower left
+    ax3 = fig1.add_axes([0.07, 0.07, 0.39, 0.30])   # lower left
+    ax4 = fig1.add_axes([0.56, 0.37, w1, w1/2*3])   # upper right
     offset_mark = 0
     yc = ypos
     for ix, x in enumerate(np.arange(30, nx-200, xstep)):

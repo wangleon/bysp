@@ -579,11 +579,26 @@ class YFOSC(FOSCReducer):
             allwave = self.wave[fileid]
             linelist = self.ident[fileid]
 
-            distortion = find_distortion(data, hwidth=5, disp_axis='y',
-                                         linelist=linelist,
-                                         deg=4, xorder=4, yorder=4)
+            distortion, fig1, fig3d = find_distortion(data,
+                                        hwidth=5, disp_axis='y',
+                                        linelist=linelist,
+                                        deg=4, xorder=4, yorder=4)
+            fig1.suptitle('Distortion of {}'.format(fileid))
+            fig1.savefig('distortion_{}.pdf'.format(fileid))
+            fig1.savefig('distortion_{}.png'.format(fileid))
+            plt.close(fig1)
+            #fig3d.suptitle('Distortion of {}'.format(fileid))
+            fig3d.suptitle('YFOSC')
+            fig3d.savefig('distortion3d_{}.pdf'.format(fileid))
+            fig3d.savefig('distortion3d_{}.png'.format(fileid))
+            plt.close(fig3d)
 
+            # plot distortion map
             fig = distortion.plot(times=10)
+            fig.suptitle('YFOSC', fontsize=13)
+            fig.savefig('distortion_yfosc.pdf')
+            fig.savefig('distortion_yfosc.png')
+            plt.close(fig)
             newdata = distortion.correct_image(data)
 
             #fig = plt.figure()
